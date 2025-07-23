@@ -142,10 +142,11 @@ func (em *ExitManager) listenForSignals() {
 	})
 }
 
-// Helper to run all cleanup functions
+// Helper to run all cleanup functions in FILO order.
 func (em *ExitManager) runCleanups() {
 	em.mu.Lock()
-	cleanups := append([]func(){}, slices.Reverse(em.cleanups)...) // copy to avoid holding lock during execution
+	cleanups := append([]func(){}, em.cleanups...) // copy to avoid holding lock during execution
+	slices.Reverse(cleanups)
 	em.mu.Unlock()
 	for _, f := range cleanups {
 		f()
