@@ -2,6 +2,7 @@ package exitmanager
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,107 +12,140 @@ import (
 	"time"
 )
 
-var (
-	managers []*ExitManager
-	once     sync.Once
-	l        *sync.Mutex
-)
+// TimeoutConfig sets configuration for handling timeouts.
+type TimeoutConfig struct {
+	Soft time.Duration // Wait for graceful completion
+	Hard time.Duration // Force exit after this total time
+}
 
-// ExitManager manages graceful shutdowns.
+// ExitManager manages graceful shutdowns for applications.
+// It provides mechanisms to coordinate shutdown signals, manage in-flight operations,
+// and execute cleanup functions in an orderly manner.
 type ExitManager struct {
-	mu         *sync.RWMutex
+	mu         *sync.Mutex
 	cond       *sync.Cond
-	locks      int
 	notified   bool
 	notifyCh   chan struct{}
-	timeout    time.Duration
+	locks      int
+	timeouts   TimeoutConfig
 	signalOnce sync.Once
 	cleanups   []func()
-	inFlight   int // Track in-flight requests
+	inFlight   int
 }
 
-// Register ExitManager on multiple events. I don't think this is needed by leaving for now.
-func Register(mgr *ExitManager) {
+var (
+	once    sync.Once
+	manager *ExitManager
+)
+
+// New will return a singleton ExitManager instance.
+// Only the first call to New will create and register the exit manager.
+// The manager automatically starts listening for process SIGINT and SIGTERM signals.
+func New() *ExitManager {
 	once.Do(func() {
-		l = &sync.Mutex{}
+		em := &ExitManager{
+			mu:       &sync.Mutex{},
+			notifyCh: make(chan struct{}),
+			timeouts: TimeoutConfig{},
+		}
+		em.cond = sync.NewCond(em.mu)
+		go em.listenForSignals()
+		manager = em
 	})
-	l.Lock()
-	defer l.Unlock()
-	managers = append(managers, mgr)
+	return manager
 }
 
-// NewExitManager creates a new ExitManager with the given timeout.
-func New(timeout time.Duration) *ExitManager {
-	em := &ExitManager{
-		mu:       &sync.RWMutex{},
-		notifyCh: make(chan struct{}),
-		timeout:  timeout,
-	}
-	em.cond = sync.NewCond(em.mu)
-	go em.listenForSignals()
-	return em
-}
-
-// Update timeout.
-func (em *ExitManager) SetTimeout(timeout time.Duration) {
+// SetTimeout updates the shutdown timeout for the exit manager. The timeout determines how long to wait for all locks to be
+// released and cleanup functions to complete before forcefully exiting. Time timeout is only supported for
+// By default, there is no timeout, giving processes unlimited time to clean up.
+// Setting timeout to 0 or less disables timeout.
+func (em *ExitManager) SetTimeouts(timeouts TimeoutConfig) {
 	em.mu.Lock()
-	defer em.mu.Unlock()
-	em.timeout = timeout
+	em.timeouts = timeouts
+	em.mu.Unlock()
 }
 
-// TryLock will soft lock the exit manager if the exit manager is not already exiting.
-func (em *ExitManager) TryLock() bool {
-	if em.isExiting() {
-		return false
+// AcquireShutdownLock attempts to acquire a shutdown lock from the exit manager, and will return an error if the exit manager
+// is already notified to shutdown. Multiple locks can be held simultaneously across different goroutines and processes. Each
+// successful AcquireShutdownLock call must be paired with ReleaseShutdownLock. This lock prevents shutdown to occur until all
+// critical operations are complete.
+func (em *ExitManager) AcquireShutdownLock() error {
+	em.mu.Lock()
+	if em.notified {
+		em.mu.Unlock()
+		return errors.New("exit manager has been notified: process shutdown")
+	} else {
+		em.locks++
+		em.mu.Unlock()
+		return nil
 	}
-	defer em.mu.RUnlock()
-	em.locks++
-	return true
 }
 
-// Unlock will remove the soft lock to the exit manager.
-func (em *ExitManager) Unlock() {
-	em.mu.RLock()
-	defer em.mu.RUnlock()
+// ReleaseShutdownLock decrements the shutdown lock counter. When the lock count reaches zero and the exit manager has been notified,
+// it broadcasts to waiting goroutines that shutdown can proceed. This should be called to release every lock acquired with
+// AcquireShutdownLock.
+func (em *ExitManager) ReleaseShutdownLock() {
+	em.mu.Lock()
 	if em.locks > 0 {
 		em.locks--
 	}
 	if em.locks == 0 && em.notified {
 		em.cond.Broadcast()
 	}
+	em.mu.Unlock()
 }
 
-// WithCancelOnShutdown cancels context which can signal shutdown across via context.WithCancel(ctx).
-func (em *ExitManager) WithCancelOnShutdown(ctx context.Context) context.Context {
+// Notify returns a receive-only channel that is closed when the exit manager receives a shutdown signal (SIGINT or SIGTERM).
+// This can be used to detect shutdown events across different parts of the application.
+// The channel is closed once when the first shutdown signal is received.
+func (em *ExitManager) Notify() <-chan struct{} {
+	return em.notifyCh
+}
+
+// WithCancel returns a context that is cancelled when the exit manager receives a shutdown signal.
+// If the exit manager has already recieved a shutdown signal, a cancelled context will be returned.
+// The cancel function should still be called to clean as with context.WithCancel.
+func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
-	go func() {
-		<-em.Notify()
+	done := make(chan struct{})
+
+	if em.notified {
 		cancel()
+		return ctx, cancel
+	}
+
+	once := sync.Once{}
+	cleanup := func() {
+		once.Do(func() {
+			close(done)
+			cancel()
+		})
+	}
+
+	go func() {
+		select {
+		case <-done:
+		case <-em.Notify():
+			cleanup()
+		}
 	}()
-	return ctx
+
+	return ctx, cleanup
 }
 
-func (em *ExitManager) Cleanup(f func()) {
+// RegisterCleanup registers a cleanup function to be executed during shutdown.
+// Cleanup functions are executed in LIFO (Last In, First Out) order during the shutdown process.
+// The exit manager waits for all cleanup functions to complete before terminating, unless the configured timeout expires.
+func (em *ExitManager) RegisterCleanup(f func()) {
 	em.mu.Lock()
 	defer em.mu.Unlock()
 	em.cleanups = append(em.cleanups, f)
 }
 
-func (em *ExitManager) isExiting() bool {
-	em.mu.Lock()
-	defer em.mu.Unlock()
-	return em.notified
-}
-
-// Notify can be watched on chan close event, indicating either signal has been recieved by the exit-manager.
-func (em *ExitManager) Notify() <-chan struct{} {
-	return em.notifyCh
-}
-
-// HttpHealthCheckMiddleware provides an http.Handler to handle shutdown HTTP health check endpoint.
+// HTTPHealthCheckMiddleware provides an http.Handler to handle shutdown HTTP health check endpoint.
 // You can register this to inform load balancers that they are no longer taking requests on health check endpoints.
 // This is differ
-func (em *ExitManager) HttpHealthCheckMiddleware() func(http.Handler) http.Handler {
+func (em *ExitManager) HTTPHealthCheckMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			select {
@@ -119,14 +153,15 @@ func (em *ExitManager) HttpHealthCheckMiddleware() func(http.Handler) http.Handl
 				http.Error(w, "Service Unavailable: shutting down", http.StatusServiceUnavailable)
 				return
 			default:
+				next.ServeHTTP(w, r)
 			}
-			next.ServeHTTP(w, r)
 		})
 	}
 }
 
-// HttpRequestMiddleware provides http.Handler to handle requests gracefully across http services.
-func (em *ExitManager) HttpRequestMiddleware() func(http.Handler) http.Handler {
+// HTTPGracefulShutdownMiddleware provides http.Handler to handle requests gracefully across http services.
+// If withCancel is true, requests will be cancelled on exit manager notify event.
+func (em *ExitManager) HTTPGracefulShutdownMiddleware(withCancel bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			em.mu.Lock()
@@ -147,50 +182,76 @@ func (em *ExitManager) HttpRequestMiddleware() func(http.Handler) http.Handler {
 				em.mu.Unlock()
 			}()
 
-			ctx := em.WithCancelOnShutdown(r.Context())
+			ctx := r.Context()
+			var cancel context.CancelFunc
+			if withCancel {
+				ctx, cancel = em.WithCancel(ctx)
+				defer cancel()
+			}
+
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
+// listenForSignals registers signal handler and manages the shutdown process.
 func (em *ExitManager) listenForSignals() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh // Wait for signal
+	<-sigCh
 
 	em.signalOnce.Do(func() {
 		em.mu.Lock()
 		em.notified = true
-		close(em.notifyCh) // Notify all listeners
-		em.runCleanups()
-		if em.locks == 0 {
-			em.mu.Unlock()
-			os.Exit(0)
-		}
-		// Wait for locks to be released or timeout
-		done := make(chan struct{})
+		close(em.notifyCh)
+		em.mu.Unlock()
+
+		softDone := make(chan struct{})
+		hardDone := make(chan struct{})
 		go func() {
 			for em.locks > 0 {
 				em.cond.Wait()
 			}
-			close(done)
+			for em.inFlight > 0 {
+				em.cond.Wait()
+			}
+			close(softDone)
+			em.runCleanups()
+			close(hardDone)
 		}()
-		timeout := em.timeout
-		em.mu.Unlock()
 
-		select {
-		case <-done:
+		// no timeouts
+		timeouts := em.timeouts
+		if timeouts.Hard <= 0 && timeouts.Soft <= 0 {
+			<-hardDone
 			os.Exit(0)
-		case <-time.After(timeout):
+		}
+
+		// without hard timeout
+		if timeouts.Hard <= 0 {
+			<-softDone
+			select {
+			case <-hardDone:
+				os.Exit(0)
+			case <-time.After(timeouts.Soft):
+				os.Exit(1)
+			}
+		}
+
+		// using hard timeout
+		select {
+		case <-hardDone:
+			os.Exit(0)
+		case <-time.After(timeouts.Hard):
 			os.Exit(1)
 		}
 	})
 }
 
-// Helper to run all cleanup functions in FILO order.
+// runCleanups executes all registered cleanup functions in last in, first out (LIFO) order.
 func (em *ExitManager) runCleanups() {
 	em.mu.Lock()
-	cleanups := append([]func(){}, em.cleanups...) // copy to avoid holding lock during execution
+	cleanups := append([]func(){}, em.cleanups...)
 	slices.Reverse(cleanups)
 	em.mu.Unlock()
 	for _, f := range cleanups {

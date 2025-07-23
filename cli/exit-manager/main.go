@@ -50,8 +50,7 @@ func getNotified(em *exitmanager.ExitManager) bool {
 
 func main() {
 	timeout := 10 * time.Second
-	em := exitmanager.New(timeout)
-	exitmanager.Register(em)
+	em := exitmanager.Register(timeout)
 
 	em.Cleanup(func() { fmt.Println("[Cleanup] First cleanup executed!") })
 	em.Cleanup(func() { fmt.Println("[Cleanup] Second cleanup executed!") })
@@ -76,7 +75,7 @@ func main() {
 		input = strings.TrimSpace(input)
 		switch input {
 		case "l":
-			if em.TryLock() {
+			if em.LockInc() {
 				locked++
 				fmt.Println("[Action] Locked (in-flight work started)")
 			} else {
@@ -85,7 +84,7 @@ func main() {
 			printState(em)
 		case "u":
 			if locked > 0 {
-				em.Unlock()
+				em.LockDec()
 				locked--
 				fmt.Println("[Action] Unlocked (work completed)")
 			} else {
