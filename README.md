@@ -4,6 +4,7 @@ WIP!
 
 Exit manager is a Go module for handling `SIGINT` and `SIGTERM` signals gracefully in long-running services. It gives you control over when and how your application shuts down, allowing an application to complete and exit cleanly across multiple routines. Additionally, the exit manager provides methods to block future requests while the application is closing down.
 
+
 ## Use Cases
 
 * Handling graceful shutdown across distributed or batched processing systems.
@@ -12,7 +13,7 @@ Exit manager is a Go module for handling `SIGINT` and `SIGTERM` signals graceful
 
 ## Features
 
-Actions to be taken when `SIGINT` or `SIGTERM` is recieved:
+You must register the exit manager to effect the shutdown process. Actions to be taken when `SIGINT` or `SIGTERM` is recieved:
 
 | State           | Action Taken                                    |
 | --------------- | ----------------------------------------------- |
@@ -23,11 +24,12 @@ Actions to be taken when `SIGINT` or `SIGTERM` is recieved:
 
 ## CLI Demo Tool
 
-Explore `/cli/exit-manager` to try the exit manager interactively. The program uses keybindings to trigger signals, lock/unlock the exit manager, and simulate real-world shutdown behavior. Useful for learning, testing, and debugging.
+Explore `/cli` to try the exit manager in different use cases interactively. The program uses keybindings to trigger signals, lock/unlock the exit manager, and simulate real-world shutdown behavior. Useful for learning, testing, and debugging.
 
 ## Future
 
-- [ ] Manage system cleanup.
-- [ ] Provide HTTP handler integration.
+- [X] Manage system cleanup.
+- [X] Provide HTTP handler integration.
+- [ ] Remove sub-manager pattern to simply interface. 
 - [ ] Provide tests which hijack / replace `SIGINT`, `SIGTERM`.
 - [ ] Register logging adapter pattern for external loggers such as zerolog, etc.
