@@ -48,7 +48,7 @@ func getNotified(em *exitmanager.ExitManager) bool {
 }
 
 func main() {
-	em := exitmanager.New()
+	em := exitmanager.Global()
 	em.RegisterCleanup(func() { fmt.Println("[Cleanup] First cleanup executed!") })
 	em.RegisterCleanup(func() { fmt.Println("[Cleanup] Second cleanup executed!") })
 

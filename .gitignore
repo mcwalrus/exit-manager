@@ -7,8 +7,8 @@
 *.dll
 *.so
 *.dylib
-cli/exit-manager/exit-manager
-cli/http-exit-manager/http-exit-manager
+cmd/exit-manager/exit-manager
+cmd/http-exit-manager/http-exit-manager
 
 # Test binary, built with `go test -c`
 *.test

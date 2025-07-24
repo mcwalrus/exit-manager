@@ -14,24 +14,25 @@ import (
 )
 
 func main() {
-	em := exitmanager.New()
+	em := exitmanager.Global()
 
 	// Health endpoint with ExitManager middleware
 	healthHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
-	http.Handle("/health", em.HTTPHealthCheckMiddleware()(healthHandler))
+	http.Handle("/health", em.HTTPServiceUnavailableMiddleware()(healthHandler))
 
 	// Request endpoint with ExitManager middleware
 	requestHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Println("/request: started")
-		time.Sleep(1 * time.Second)
+		time.Sleep(10 * time.Second)
 		fmt.Fprintln(w, "request complete")
 		log.Println("/request: finished")
 	})
 	http.Handle("/request", em.HTTPGracefulShutdownMiddleware()(requestHandler))
 
 	server := &http.Server{Addr: ":8080"}
+	em.RegisterHTTPServer(server)
 
 	// Register cleanup to shutdown HTTP server
 	em.RegisterCleanup(func() {
