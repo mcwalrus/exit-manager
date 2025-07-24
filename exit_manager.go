@@ -102,6 +102,14 @@ func (em *ExitManager) Notify() <-chan struct{} {
 	return em.notifyCh
 }
 
+// Shutdown provides the signal interrupt to the current process initating the exit manager process.
+// This works for linux compabatible operating systems (does not work for Windows).
+func (em *ExitManager) Shutdown() error {
+	p, _ := os.FindProcess(os.Getpid())
+	_ = p.Signal(os.Interrupt)
+	return nil
+}
+
 // WithCancel returns a context that is cancelled when the exit manager receives a shutdown signal.
 // If the exit manager has already recieved a shutdown signal, a cancelled context will be returned.
 // The cancel function should still be called to clean as with context.WithCancel.
@@ -161,7 +169,8 @@ func (em *ExitManager) HTTPHealthCheckMiddleware() func(http.Handler) http.Handl
 
 // HTTPGracefulShutdownMiddleware provides http.Handler to handle requests gracefully across http services.
 // If withCancel is true, requests will be cancelled on exit manager notify event.
-func (em *ExitManager) HTTPGracefulShutdownMiddleware(withCancel bool) func(http.Handler) http.Handler {
+// This differs from http.Server shutdown which ...
+func (em *ExitManager) HTTPGracefulShutdownMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			em.mu.Lock()
@@ -182,12 +191,37 @@ func (em *ExitManager) HTTPGracefulShutdownMiddleware(withCancel bool) func(http
 				em.mu.Unlock()
 			}()
 
-			ctx := r.Context()
-			var cancel context.CancelFunc
-			if withCancel {
-				ctx, cancel = em.WithCancel(ctx)
-				defer cancel()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// HTTPGracefulShutdownMiddleware provides http.Handler to handle requests gracefully across http services.
+// If withCancel is true, requests will be cancelled on exit manager notify event.
+// This differs from http.Server shutdown which ...
+func (em *ExitManager) HTTPGracefulShutdownWithCancelMiddleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			em.mu.Lock()
+			if em.notified {
+				em.mu.Unlock()
+				http.Error(w, "Service Unavailable: shutting down", http.StatusServiceUnavailable)
+				return
 			}
+			em.inFlight++
+			em.mu.Unlock()
+
+			defer func() {
+				em.mu.Lock()
+				em.inFlight--
+				if em.inFlight == 0 && em.notified {
+					em.cond.Broadcast()
+				}
+				em.mu.Unlock()
+			}()
+
+			ctx, cancel := em.WithCancel(r.Context())
+			defer cancel()
 
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

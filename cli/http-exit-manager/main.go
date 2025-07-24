@@ -14,14 +14,13 @@ import (
 )
 
 func main() {
-	timeout := 10 * time.Second
-	em := exitmanager.Register(timeout)
+	em := exitmanager.New()
 
 	// Health endpoint with ExitManager middleware
 	healthHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
-	http.Handle("/health", em.HttpHealthCheckMiddleware()(healthHandler))
+	http.Handle("/health", em.HTTPHealthCheckMiddleware()(healthHandler))
 
 	// Request endpoint with ExitManager middleware
 	requestHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -30,12 +29,12 @@ func main() {
 		fmt.Fprintln(w, "request complete")
 		log.Println("/request: finished")
 	})
-	http.Handle("/request", em.HttpRequestMiddleware()(requestHandler))
+	http.Handle("/request", em.HTTPGracefulShutdownMiddleware()(requestHandler))
 
 	server := &http.Server{Addr: ":8080"}
 
 	// Register cleanup to shutdown HTTP server
-	em.Cleanup(func() {
+	em.RegisterCleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
@@ -59,13 +58,13 @@ func main() {
 		input = strings.TrimSpace(input)
 		switch input {
 		case "l":
-			if em.LockInc() {
+			if err := em.AcquireShutdownLock(); err != nil {
 				fmt.Println("Locked exit manager (simulating in-flight work)")
 			} else {
 				fmt.Println("Could not lock: already shutting down")
 			}
 		case "u":
-			em.LockDec()
+			em.ReleaseShutdownLock()
 			fmt.Println("Unlocked exit manager")
 		case "h":
 			resp, err := http.Get("http://localhost:8080/health")

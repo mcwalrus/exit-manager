@@ -7,7 +7,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	exitmanager "github.com/mcwalrus/exit-manager"
 )
@@ -49,11 +48,9 @@ func getNotified(em *exitmanager.ExitManager) bool {
 }
 
 func main() {
-	timeout := 10 * time.Second
-	em := exitmanager.Register(timeout)
-
-	em.Cleanup(func() { fmt.Println("[Cleanup] First cleanup executed!") })
-	em.Cleanup(func() { fmt.Println("[Cleanup] Second cleanup executed!") })
+	em := exitmanager.New()
+	em.RegisterCleanup(func() { fmt.Println("[Cleanup] First cleanup executed!") })
+	em.RegisterCleanup(func() { fmt.Println("[Cleanup] Second cleanup executed!") })
 
 	// Listen for real signals in background
 	sigCh := make(chan os.Signal, 1)
@@ -75,7 +72,7 @@ func main() {
 		input = strings.TrimSpace(input)
 		switch input {
 		case "l":
-			if em.LockInc() {
+			if err := em.AcquireShutdownLock(); err != nil {
 				locked++
 				fmt.Println("[Action] Locked (in-flight work started)")
 			} else {
@@ -84,7 +81,7 @@ func main() {
 			printState(em)
 		case "u":
 			if locked > 0 {
-				em.LockDec()
+				em.ReleaseShutdownLock()
 				locked--
 				fmt.Println("[Action] Unlocked (work completed)")
 			} else {
