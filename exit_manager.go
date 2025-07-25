@@ -12,11 +12,19 @@ import (
 	"time"
 )
 
-// TimeoutConfig sets configuration for handling timeouts.
-type TimeoutConfig struct {
-	Soft time.Duration // Exit on soft timeout for time taken to cleanup.
-	Hard time.Duration // Force exit after this total time
-}
+// TimeoutMode describes various options of timeout methods.
+type TimeoutMode int
+
+var (
+	// TimeoutModeHard will force exit after timeout occurs.
+	// This is considerable to set if a locked state isn't set to release.
+	TimeoutModeHard TimeoutMode = iota
+	TimeoutModeSoft
+	TimeoutModeServerShutdown
+	// TimeoutModeSoft only begins counting timeout at the start of the cleanup functions.
+	// This allows time for other processes to cleanup first such as release of locks, http servers, in-flight processes.
+	// TimeoutModeServerShutdown is the amount of time 
+)
 
 // ExitManager manages graceful shutdowns for applications and http.Server.
 // It provides mechanisms to coordinate shutdown signals, manage in-flight operations,
@@ -27,7 +35,7 @@ type ExitManager struct {
 	notified   bool
 	notifyCh   chan struct{}
 	locks      int
-	timeouts   TimeoutConfig
+	timeout    time.Duration
 	signalOnce sync.Once
 	cleanups   []func()
 	inFlight   int
@@ -47,7 +55,6 @@ func Global() *ExitManager {
 		em := &ExitManager{
 			mu:       &sync.Mutex{},
 			notifyCh: make(chan struct{}),
-			timeouts: TimeoutConfig{},
 		}
 		em.cond = sync.NewCond(em.mu)
 		go em.listenForSignals()
@@ -60,10 +67,18 @@ func Global() *ExitManager {
 // released and cleanup functions to complete before forcefully exiting. Time timeout is only supported for
 // By default, there is no timeout, giving processes unlimited time to clean up.
 // Setting timeout to 0 or less disables timeout.
-func (em *ExitManager) SetTimeouts(timeouts TimeoutConfig) {
+func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
 	em.mu.Lock()
+	em.timeoutMode = mode
 	em.timeouts = timeouts
 	em.mu.Unlock()
+}
+
+// Locks returns the number of locks acquired by exit manager.
+func (em *ExitManager) Locks() int {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	return em.locks
 }
 
 // AcquireShutdownLock attempts to acquire a shutdown lock from the exit manager, and will return an error if the exit manager
@@ -152,6 +167,8 @@ func (em *ExitManager) RegisterCleanup(f func()) {
 }
 
 // RegisterHTTPServer registers an http.Server to be gracefully shut down before other cleanups.
+// A service might provide many http servers for different endpoints: e.g API, metrics, debugging, etc.
+// We want to provide a cleanup service 
 func (em *ExitManager) RegisterHTTPServer(srv *http.Server) {
 	em.mu.Lock()
 	defer em.mu.Unlock()
