@@ -3,7 +3,6 @@ package exitmanager
 import (
 	"context"
 	"errors"
-	"net/http"
 	"os"
 	"os/signal"
 	"slices"
@@ -12,34 +11,17 @@ import (
 	"time"
 )
 
-// TimeoutMode describes various options of timeout methods.
-type TimeoutMode int
-
-var (
-	// TimeoutModeHard will force exit after timeout occurs.
-	// This is considerable to set if a locked state isn't set to release.
-	TimeoutModeHard TimeoutMode = iota
-	TimeoutModeSoft
-	TimeoutModeServerShutdown
-	// TimeoutModeSoft only begins counting timeout at the start of the cleanup functions.
-	// This allows time for other processes to cleanup first such as release of locks, http servers, in-flight processes.
-	// TimeoutModeServerShutdown is the amount of time 
-)
-
-// ExitManager manages graceful shutdowns for applications and http.Server.
-// It provides mechanisms to coordinate shutdown signals, manage in-flight operations,
-// and execute cleanup functions in an orderly manner.
+// ExitManager manages graceful shutdowns for programs.
+// It provides mechanisms to coordinate shutdown once all AcquireShutdownLocks are released.
+// Once they are released, the manager executes registered cleanup functions before exiting.
 type ExitManager struct {
-	mu         *sync.Mutex
-	cond       *sync.Cond
-	notified   bool
-	notifyCh   chan struct{}
-	locks      int
-	timeout    time.Duration
-	signalOnce sync.Once
-	cleanups   []func()
-	inFlight   int
-	servers    []*http.Server // Registered HTTP servers to shut down first
+	mu       *sync.Mutex
+	cond     *sync.Cond
+	notified bool
+	notifyCh chan struct{}
+	locks    int
+	timeout  time.Duration
+	cleanups []func()
 }
 
 var (
@@ -48,7 +30,7 @@ var (
 )
 
 // Global will return a singleton ExitManager instance.
-// Only the first call to Global will create and register the exit manager.
+// The first call to Global will create and register the exit manager.
 // The manager automatically starts listening for process SIGINT and SIGTERM signals.
 func Global() *ExitManager {
 	once.Do(func() {
@@ -64,13 +46,12 @@ func Global() *ExitManager {
 }
 
 // SetTimeout updates the shutdown timeout for the exit manager. The timeout determines how long to wait for all locks to be
-// released and cleanup functions to complete before forcefully exiting. Time timeout is only supported for
-// By default, there is no timeout, giving processes unlimited time to clean up.
-// Setting timeout to 0 or less disables timeout.
-func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
+// released and cleanup functions to complete before forcefully exiting. Time timeout is only supported as a hard limit and may
+// exit while ShutdownLocks are held. By default, there is no timeout, processes have unlimited time to clean up. A timeout less
+// than 0 disables timeout.
+func (em *ExitManager) SetTimeout(timeout time.Duration) {
 	em.mu.Lock()
-	em.timeoutMode = mode
-	em.timeouts = timeouts
+	em.timeout = timeout
 	em.mu.Unlock()
 }
 
@@ -81,10 +62,9 @@ func (em *ExitManager) Locks() int {
 	return em.locks
 }
 
-// AcquireShutdownLock attempts to acquire a shutdown lock from the exit manager, and will return an error if the exit manager
-// is already notified to shutdown. Multiple locks can be held simultaneously across different goroutines and processes. Each
-// successful AcquireShutdownLock call must be paired with ReleaseShutdownLock. This lock prevents shutdown to occur until all
-// critical operations are complete.
+// AcquireShutdownLock attempts to acquire a shutdown lock, returning an error if the exit manager is already notified to shutdown.
+// Shutdown locks prevents shutdown to occur until all critical operations are complete. Multiple locks can be held across routines
+// simultaneously. Each successful AcquireShutdownLock call must be paired with ReleaseShutdownLock.
 func (em *ExitManager) AcquireShutdownLock() error {
 	em.mu.Lock()
 	if em.notified {
@@ -97,9 +77,8 @@ func (em *ExitManager) AcquireShutdownLock() error {
 	}
 }
 
-// ReleaseShutdownLock decrements the shutdown lock counter. When the lock count reaches zero and the exit manager has been notified,
-// it broadcasts to waiting goroutines that shutdown can proceed. This should be called to release every lock acquired with
-// AcquireShutdownLock.
+// ReleaseShutdownLock realases the shutdown lock counter.
+// This should be called to release every lock acquired with AcquireShutdownLock.
 func (em *ExitManager) ReleaseShutdownLock() {
 	em.mu.Lock()
 	if em.locks > 0 {
@@ -124,6 +103,15 @@ func (em *ExitManager) Shutdown() error {
 	p, _ := os.FindProcess(os.Getpid())
 	_ = p.Signal(os.Interrupt)
 	return nil
+}
+
+// RegisterCleanup registers a cleanup function to be executed during shutdown.
+// Cleanup functions are executed in LIFO (Last In, First Out) order during the shutdown process.
+// The exit manager waits for all cleanup functions to complete before terminating, unless the configured timeout expires.
+func (em *ExitManager) RegisterCleanup(f func()) {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	em.cleanups = append(em.cleanups, f)
 }
 
 // WithCancel returns a context that is cancelled when the exit manager is notified to shutdown.
@@ -157,192 +145,45 @@ func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context
 	return ctx, cleanup
 }
 
-// RegisterCleanup registers a cleanup function to be executed during shutdown.
-// Cleanup functions are executed in LIFO (Last In, First Out) order during the shutdown process.
-// The exit manager waits for all cleanup functions to complete before terminating, unless the configured timeout expires.
-func (em *ExitManager) RegisterCleanup(f func()) {
-	em.mu.Lock()
-	defer em.mu.Unlock()
-	em.cleanups = append(em.cleanups, f)
-}
-
-// RegisterHTTPServer registers an http.Server to be gracefully shut down before other cleanups.
-// A service might provide many http servers for different endpoints: e.g API, metrics, debugging, etc.
-// We want to provide a cleanup service 
-func (em *ExitManager) RegisterHTTPServer(srv *http.Server) {
-	em.mu.Lock()
-	defer em.mu.Unlock()
-	em.servers = append(em.servers, srv)
-}
-
-// HTTPServiceUnavailableMiddleware provides an http.Handler to handle shutdown HTTP health check endpoint.
-// You can register this to inform load balancers that they are no longer taking requests on health check endpoints.
-// This is differ
-func (em *ExitManager) HTTPServiceUnavailableMiddleware() func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			select {
-			case <-em.Notify():
-				http.Error(w, "Service Unavailable: shutting down", http.StatusServiceUnavailable)
-				return
-			default:
-				next.ServeHTTP(w, r)
-			}
-		})
-	}
-}
-
-// HTTPGracefulShutdownMiddleware provides http.Handler to handle requests gracefully across http services.
-// If withCancel is true, requests will be cancelled on exit manager notify event.
-// This differs from http.Server shutdown which ...
-func (em *ExitManager) HTTPGracefulShutdownMiddleware() func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			em.mu.Lock()
-			if em.notified {
-				em.mu.Unlock()
-				http.Error(w, "Service Unavailable: shutting down", http.StatusServiceUnavailable)
-				return
-			}
-			em.inFlight++
-			em.mu.Unlock()
-
-			defer func() {
-				em.mu.Lock()
-				em.inFlight--
-				if em.inFlight == 0 && em.notified {
-					em.cond.Broadcast()
-				}
-				em.mu.Unlock()
-			}()
-
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-// HTTPGracefulShutdownMiddleware provides http.Handler to handle requests gracefully across http services.
-// If withCancel is true, requests will be cancelled on exit manager notify event.
-// This differs from http.Server shutdown which ...
-func (em *ExitManager) HTTPGracefulShutdownWithCancelMiddleware() func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			em.mu.Lock()
-			if em.notified {
-				em.mu.Unlock()
-				http.Error(w, "Service Unavailable: shutting down", http.StatusServiceUnavailable)
-				return
-			}
-			em.inFlight++
-			em.mu.Unlock()
-
-			defer func() {
-				em.mu.Lock()
-				em.inFlight--
-				if em.inFlight == 0 && em.notified {
-					em.cond.Broadcast()
-				}
-				em.mu.Unlock()
-			}()
-
-			ctx, cancel := em.WithCancel(r.Context())
-			defer cancel()
-
-			next.ServeHTTP(w, r.WithContext(ctx))
-		})
-	}
-}
-
 // listenForSignals registers signal handler and manages the shutdown process.
 func (em *ExitManager) listenForSignals() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
 
-	em.signalOnce.Do(func() {
-		em.mu.Lock()
-		em.notified = true
-		close(em.notifyCh)
-		em.mu.Unlock()
+	select {
+	case <-sigCh:
+	case <-em.notifyCh:
+	}
 
-		softDone := make(chan struct{})
-		hardDone := make(chan struct{})
-		go func() {
-			for em.locks > 0 {
-				em.cond.Wait()
-			}
-			em.shutdownHTTPServers()
-			for em.inFlight > 0 {
-				em.cond.Wait()
-			}
-			close(softDone)
-			em.runCleanups()
-			close(hardDone)
-		}()
-
-		// no timeouts
-		timeouts := em.timeouts
-		if timeouts.Hard <= 0 && timeouts.Soft <= 0 {
-			<-hardDone
-			os.Exit(0)
-		}
-
-		// without hard timeout, wait for softDone before timeout.
-		if timeouts.Hard <= 0 {
-			<-softDone
-			select {
-			case <-hardDone:
-				os.Exit(0)
-			case <-time.After(timeouts.Soft):
-				os.Exit(1)
-			}
-		}
-
-		// using hard timeout
-		select {
-		case <-hardDone:
-			os.Exit(0)
-		case <-time.After(timeouts.Hard):
-			os.Exit(1)
-		}
-	})
-}
-
-// shutdownHTTPServers gracefully shuts down all registered HTTP servers before other cleanups.
-// Applies cancellation to shutdown for servers which take longer than the soft timeout period.
-func (em *ExitManager) shutdownHTTPServers() {
 	em.mu.Lock()
-	servers := append([]*http.Server{}, em.servers...)
+	em.notified = true
+	close(em.notifyCh)
 	em.mu.Unlock()
-	if len(servers) == 0 {
-		return
+
+	done := make(chan struct{})
+	go func() {
+		for em.locks > 0 {
+			em.cond.Wait()
+		}
+		cleanups := append([]func(){}, em.cleanups...)
+		slices.Reverse(cleanups)
+		for _, f := range cleanups {
+			f()
+		}
+		close(done)
+	}()
+
+	// no timeout
+	if em.timeout <= 0 {
+		<-done
+		os.Exit(0)
 	}
 
-	var wg sync.WaitGroup
-	ctx := context.Background()
-	if em.timeouts.Soft > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, em.timeouts.Soft)
-		defer cancel()
-	}
-
-	for _, srv := range servers {
-		wg.Add(1)
-		go func(s *http.Server) {
-			defer wg.Done()
-			_ = s.Shutdown(ctx)
-		}(srv)
-	}
-	wg.Wait()
-}
-
-// runCleanups executes all registered cleanup functions in last in, first out (LIFO) order.
-func (em *ExitManager) runCleanups() {
-	em.mu.Lock()
-	cleanups := append([]func(){}, em.cleanups...)
-	slices.Reverse(cleanups)
-	em.mu.Unlock()
-	for _, f := range cleanups {
-		f()
+	// timeout set
+	select {
+	case <-done:
+		os.Exit(0)
+	case <-time.After(em.timeout):
+		os.Exit(1)
 	}
 }
