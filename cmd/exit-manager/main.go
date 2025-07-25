@@ -18,20 +18,11 @@ func printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  l - Lock (simulate in-flight work)")
 	fmt.Println("  u - Unlock (complete work)")
-	fmt.Println("  s - Simulate SIGINT/SIGTERM (trigger shutdown)")
+	fmt.Println("  s - Shutdown Action (trigger shutdown)")
 	fmt.Println("  p - Print state of exit maanger")
 	fmt.Println("  st <duration> - Set timeout (e.g., ts 10s, less than 0 for no timeout)")
 	fmt.Println("  q - Quit immediately")
 	fmt.Println("  h - Help")
-}
-
-// Helper to access private fields for demo (reflection or via exported methods if available)
-func getLocks(em *exitmanager.ExitManager) int {
-	type locker interface{ Locks() int }
-	if l, ok := any(em).(locker); ok {
-		return l.Locks()
-	}
-	return -1
 }
 
 func getNotified(em *exitmanager.ExitManager) bool {
@@ -104,7 +95,7 @@ func main() {
 			}
 			printState(em)
 		case "s":
-			fmt.Println("[Action] Simulating SIGINT/SIGTERM...")
+			fmt.Println("[Action] Shutdown...")
 			p, _ := os.FindProcess(os.Getpid())
 			_ = p.Signal(syscall.SIGINT)
 		case "st":

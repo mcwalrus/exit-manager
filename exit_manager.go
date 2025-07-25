@@ -15,11 +15,12 @@ import (
 // It provides mechanisms to coordinate shutdown once all AcquireShutdownLocks are released.
 // Once they are released, the manager executes registered cleanup functions before exiting.
 type ExitManager struct {
-	mu       *sync.Mutex
-	cond     *sync.Cond
+	mu *sync.Mutex
+	// cond     *sync.Cond
 	notified bool
 	notifyCh chan struct{}
 	locks    int
+	locksCh  chan struct{}
 	timeout  time.Duration
 	cleanups []func()
 }
@@ -37,8 +38,9 @@ func Global() *ExitManager {
 		em := &ExitManager{
 			mu:       &sync.Mutex{},
 			notifyCh: make(chan struct{}),
+			locksCh:  make(chan struct{}),
 		}
-		em.cond = sync.NewCond(em.mu)
+		// em.cond = sync.NewCond(em.mu)
 		go em.listenForSignals()
 		manager = em
 	})
@@ -85,7 +87,11 @@ func (em *ExitManager) ReleaseShutdownLock() {
 		em.locks--
 	}
 	if em.locks == 0 && em.notified {
-		em.cond.Broadcast()
+		select {
+		case <-em.locksCh:
+		default:
+			close(em.locksCh)
+		}
 	}
 	em.mu.Unlock()
 }
@@ -97,12 +103,16 @@ func (em *ExitManager) Notify() <-chan struct{} {
 	return em.notifyCh
 }
 
-// Shutdown provides the signal interrupt to the current process initating the exit manager process.
-// This works for linux compabatible operating systems (does not work for Windows).
-func (em *ExitManager) Shutdown() error {
-	p, _ := os.FindProcess(os.Getpid())
-	_ = p.Signal(os.Interrupt)
-	return nil
+// Shutdown signals exit manager to interrupt to the current process initating the shutdown process.
+// Method can be called multiple times without any affect.
+func (em *ExitManager) Shutdown() {
+	em.mu.Lock()
+	select {
+	case <-em.notifyCh:
+	default:
+		close(em.notifyCh)
+	}
+	em.mu.Unlock()
 }
 
 // RegisterCleanup registers a cleanup function to be executed during shutdown.
@@ -163,7 +173,7 @@ func (em *ExitManager) listenForSignals() {
 	done := make(chan struct{})
 	go func() {
 		for em.locks > 0 {
-			em.cond.Wait()
+			<-em.locksCh
 		}
 		cleanups := append([]func(){}, em.cleanups...)
 		slices.Reverse(cleanups)
