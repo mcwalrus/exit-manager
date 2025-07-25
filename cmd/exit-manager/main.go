@@ -19,15 +19,10 @@ func printHelp() {
 	fmt.Println("  l - Lock (simulate in-flight work)")
 	fmt.Println("  u - Unlock (complete work)")
 	fmt.Println("  s - Simulate SIGINT/SIGTERM (trigger shutdown)")
-	fmt.Println("  t - Show current timeouts")
-	fmt.Println("  ts <duration> - Set soft timeout (e.g., ts 10s)")
-	fmt.Println("  th <duration> - Set hard timeout (e.g., th 30s)")
+	fmt.Println("  p - Print state of exit maanger")
+	fmt.Println("  st <duration> - Set timeout (e.g., ts 10s, less than 0 for no timeout)")
 	fmt.Println("  q - Quit immediately")
 	fmt.Println("  h - Help")
-}
-
-func printState(em *exitmanager.ExitManager) {
-	fmt.Printf("\n[State] Locks: %d, Notified: %v\n", getLocks(em), getNotified(em))
 }
 
 // Helper to access private fields for demo (reflection or via exported methods if available)
@@ -51,33 +46,20 @@ func getNotified(em *exitmanager.ExitManager) bool {
 	return n
 }
 
-func printTimeouts(em *exitmanager.ExitManager) {
-	t := getTimeouts(em)
-	fmt.Printf("[Timeouts] Soft: %v, Hard: %v\n", t.Soft, t.Hard)
-}
-
-func getTimeouts(em *exitmanager.ExitManager) exitmanager.TimeoutConfig {
-	type timeouter interface {
-		GetTimeouts() exitmanager.TimeoutConfig
-	}
-	if t, ok := any(em).(timeouter); ok {
-		return t.GetTimeouts()
-	}
-	// fallback: not accessible
-	return exitmanager.TimeoutConfig{}
-}
-
 func main() {
-	softTimeout := flag.Duration("soft-timeout", time.Second*10, "Soft timeout duration (e.g., 10s)")
-	hardTimeout := flag.Duration("hard-timeout", time.Second*30, "Hard timeout duration (e.g., 30s)")
+	timeout := flag.Duration("timeout", time.Second*10, "Timeout duration (e.g., 10s)")
 	flag.Parse()
 
 	em := exitmanager.Global()
 
 	// Set initial timeouts from flags
-	em.SetTimeouts(exitmanager.TimeoutConfig{Soft: *softTimeout, Hard: *hardTimeout})
+	em.SetTimeout(*timeout)
 	em.RegisterCleanup(func() { fmt.Println("[Cleanup] First cleanup executed!") })
 	em.RegisterCleanup(func() { fmt.Println("[Cleanup] Second cleanup executed!") })
+
+	printState := func(em *exitmanager.ExitManager) {
+		fmt.Printf("\n[State] Locks: %d, Timeout: %v, Notified: %v\n", em.Locks(), *timeout, getNotified(em))
+	}
 
 	fmt.Printf("Process ID: %d\n", os.Getpid())
 
@@ -91,7 +73,6 @@ func main() {
 
 	printHelp()
 	printState(em)
-	printTimeouts(em)
 	reader := bufio.NewReader(os.Stdin)
 
 	locked := 0
@@ -126,11 +107,9 @@ func main() {
 			fmt.Println("[Action] Simulating SIGINT/SIGTERM...")
 			p, _ := os.FindProcess(os.Getpid())
 			_ = p.Signal(syscall.SIGINT)
-		case "t":
-			printTimeouts(em)
-		case "ts":
+		case "st":
 			if len(fields) < 2 {
-				fmt.Println("Usage: ts <duration>")
+				fmt.Println("Usage: st <duration>")
 				continue
 			}
 			dur, err := time.ParseDuration(fields[1])
@@ -138,24 +117,9 @@ func main() {
 				fmt.Println("Invalid duration:", err)
 				continue
 			}
-			t := getTimeouts(em)
-			t.Soft = dur
-			em.SetTimeouts(t)
-			fmt.Println("[Timeout] Soft timeout set to", dur)
-		case "th":
-			if len(fields) < 2 {
-				fmt.Println("Usage: th <duration>")
-				continue
-			}
-			dur, err := time.ParseDuration(fields[1])
-			if err != nil {
-				fmt.Println("Invalid duration:", err)
-				continue
-			}
-			t := getTimeouts(em)
-			t.Hard = dur
-			em.SetTimeouts(t)
-			fmt.Println("[Timeout] Hard timeout set to", dur)
+			timeout = &dur
+			em.SetTimeout(*timeout)
+			fmt.Println("[Timeout] timeout set to", dur)
 		case "q":
 			fmt.Println("[Exit] Quitting immediately.")
 			os.Exit(0)
