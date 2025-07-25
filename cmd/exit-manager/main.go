@@ -86,8 +86,8 @@ func main() {
 			}
 			printState(em)
 		case "u":
+			em.ReleaseShutdownLock()
 			if locked > 0 {
-				em.ReleaseShutdownLock()
 				locked--
 				fmt.Println("[Action] Unlocked (work completed)")
 			} else {
@@ -96,8 +96,7 @@ func main() {
 			printState(em)
 		case "s":
 			fmt.Println("[Action] Shutdown...")
-			p, _ := os.FindProcess(os.Getpid())
-			_ = p.Signal(syscall.SIGINT)
+			em.Shutdown()
 		case "st":
 			if len(fields) < 2 {
 				fmt.Println("Usage: st <duration>")

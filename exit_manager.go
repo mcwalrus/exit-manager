@@ -15,13 +15,13 @@ import (
 // It provides mechanisms to coordinate shutdown once all AcquireShutdownLocks are released.
 // Once they are released, the manager executes registered cleanup functions before exiting.
 type ExitManager struct {
-	mu *sync.Mutex
-	// cond     *sync.Cond
-	notified bool
-	notifyCh chan struct{}
+	mu       *sync.Mutex
 	locks    int
-	locksCh  chan struct{}
+	notified bool
 	timeout  time.Duration
+	locksCh  chan struct{}
+	notifyCh chan struct{}
+	shutdown chan struct{}
 	cleanups []func()
 }
 
@@ -37,10 +37,10 @@ func Global() *ExitManager {
 	once.Do(func() {
 		em := &ExitManager{
 			mu:       &sync.Mutex{},
-			notifyCh: make(chan struct{}),
 			locksCh:  make(chan struct{}),
+			notifyCh: make(chan struct{}),
+			shutdown: make(chan struct{}),
 		}
-		// em.cond = sync.NewCond(em.mu)
 		go em.listenForSignals()
 		manager = em
 	})
@@ -96,21 +96,21 @@ func (em *ExitManager) ReleaseShutdownLock() {
 	em.mu.Unlock()
 }
 
-// Notify returns a receive-only channel that is closed when the exit manager receives a shutdown signal (SIGINT or SIGTERM).
+// Notify returns a receive-only channel that is closed when the exit manager receives a shutdown signal.
 // This method can be used to detect shutdown events across different parts of the application.
 // The channel is closed once when the first shutdown signal is received.
 func (em *ExitManager) Notify() <-chan struct{} {
 	return em.notifyCh
 }
 
-// Shutdown signals exit manager to interrupt to the current process initating the shutdown process.
+// Shutdown signals the exit manager to exit the process via shutdown sequence.
 // Method can be called multiple times without any affect.
 func (em *ExitManager) Shutdown() {
 	em.mu.Lock()
 	select {
-	case <-em.notifyCh:
+	case <-em.shutdown:
 	default:
-		close(em.notifyCh)
+		close(em.shutdown)
 	}
 	em.mu.Unlock()
 }
@@ -160,16 +160,19 @@ func (em *ExitManager) listenForSignals() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// wait for signal
 	select {
 	case <-sigCh:
-	case <-em.notifyCh:
+	case <-em.shutdown:
 	}
 
+	// notify listeners / manager
 	em.mu.Lock()
 	em.notified = true
 	close(em.notifyCh)
 	em.mu.Unlock()
 
+	// begin exit process, completed on close(done)
 	done := make(chan struct{})
 	go func() {
 		for em.locks > 0 {
