@@ -18,7 +18,7 @@ You must register the exit manager to effect the shutdown process. Actions to be
 | State           | Action Taken                                    |
 | --------------- | ----------------------------------------------- |
 | Lock not held   | Immediate exit with `os.Exit(0)`                |
-| Lock held       | Waits for `sync.WaitGroup` or timeout           |
+| Lock held       | Waits for all locks to be released              |
 | Timeout reached | Force exit with `os.Exit(1)`                    |
 | All done early  | Clean exit with `os.Exit(0)`                    |
 
@@ -28,8 +28,4 @@ Explore `/cli` to try the exit manager in different use cases interactively. The
 
 ## Future
 
-- [X] Manage system cleanup.
-- [X] Provide HTTP handler integration.
-- [ ] Remove sub-manager pattern to simply interface. 
-- [ ] Provide tests which hijack / replace `SIGINT`, `SIGTERM`.
 - [ ] Register logging adapter pattern for external loggers such as zerolog, etc.
