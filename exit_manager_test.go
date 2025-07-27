@@ -42,34 +42,53 @@ func checkManagerExitCode(t *testing.T, em *ExitManager, code int) {
 }
 
 func TestNotify(t *testing.T) {
-	em := newExitManager()
-	go em.listenForSignals()
-	em.hijackExitHandler()
+	t.Parallel()
 
-	wg := &sync.WaitGroup{}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+	t.Run("multiple listeners", func(t *testing.T) {
+		em := newExitManager()
+		go em.listenForSignals()
+		em.hijackExitHandler()
 
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func() {
-			select {
-			case <-em.Notify():
-			case <-ctx.Done():
-				time.Sleep(10 * time.Millisecond)
-			}
-			wg.Done()
-		}()
-	}
+		wg := &sync.WaitGroup{}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
 
-	em.Shutdown()
-	wg.Wait()
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func() {
+				select {
+				case <-em.Notify():
+				case <-ctx.Done():
+					time.Sleep(10 * time.Millisecond)
+				}
+				wg.Done()
+			}()
+		}
 
-	select {
-	case <-ctx.Done():
-		t.Errorf("context cancelled before all routinues were notified")
-	default:
-	}
+		em.Shutdown()
+		wg.Wait()
 
-	checkManagerExitCode(t, em, 0)
+		select {
+		case <-ctx.Done():
+			t.Errorf("context cancelled before all routinues were notified")
+		default:
+		}
+
+		checkManagerExitCode(t, em, 0)
+	})
+
+	t.Run("listen after Shutdown()", func(t *testing.T) {
+		em := newExitManager()
+		go em.listenForSignals()
+		em.hijackExitHandler()
+
+		em.Shutdown()
+		select {
+		case <-em.Notify():
+		case <-time.After(10 * time.Millisecond):
+			t.Fatal("Notify() channel was not closed after Shutdown()")
+		}
+
+		checkManagerExitCode(t, em, 0)
+	})
 }
