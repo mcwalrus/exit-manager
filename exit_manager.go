@@ -232,10 +232,9 @@ type ShutdownErrorHandler func(err error)
 // RegisterHTTPServer registers a http.Server to exit on notified event.
 // The exit manager will wait until all servers have shutdown successfully before shutting down.
 // If the error return by the call to server.Shutdown is other than http.ErrServerClosed, handleErr should take appropriate action.
-// The method will panic if handleErr is nil.
 func (em *ExitManager) RegisterHTTPServer(server *http.Server, timeout time.Duration, handleErr ShutdownErrorHandler) {
 	if handleErr == nil {
-		panic("exit-manager: no http.Server.Shutdown() handleErr func provided")
+		handleErr = func(err error) {}
 	}
 
 	// consider when exit manager is already notified
