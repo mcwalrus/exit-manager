@@ -1,6 +1,6 @@
 # Exit Manager
 
-`exitmanager` is a Go library that provides graceful shutdown coordination for Go applications, ensuring critical operations complete before process termination.
+`exitmanager` is a Go library that provides graceful shutdown coordination for applications, ensuring critical operations complete before process termination.
 
 ## Key Features
 
@@ -69,7 +69,8 @@ func main() {
     <-em.Notify()
     log.Println("Shutdown initiated, waiting for workers...")
     
-    em.Shutdown()
+    // Wait for manager to exit process
+    select {}
 }
 
 func doWork(id int) {
@@ -202,62 +203,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-## API Reference
-
-### Global Access
-
-#### `Global() *ExitManager`
-Returns the singleton ExitManager instance. Creates and initializes on first call.
-
-### Shutdown Control
-
-#### `Shutdown()`
-Programmatically initiates shutdown. Safe to call multiple times.
-
-#### `SetTimeout(timeout time.Duration)`
-Sets maximum time to wait during shutdown before forced exit. Use `<= 0` for no timeout.
-
-### Lock Management
-
-#### `AcquireShutdownLock() error`
-Acquires a shutdown lock to protect critical operations. Returns error if shutdown already initiated.
-
-#### `ReleaseShutdownLock()`
-Releases a shutdown lock. Must be called exactly once per successful acquire.
-
-#### `Locks() int`
-Returns current number of active shutdown locks.
-
-### Notifications
-
-#### `Notify() <-chan struct{}`
-Returns a channel that closes when shutdown is initiated.
-
-#### `WithCancel(ctx context.Context) (context.Context, context.CancelFunc)`
-Returns a context that cancels automatically when shutdown begins.
-
-### Cleanup
-
-#### `RegisterCleanup(f func())`
-Registers a cleanup function to execute during shutdown. Functions execute in LIFO order.
-
 ## Best Practices
 
 1. **Always pair locks**: Every `AcquireShutdownLock()` must have a corresponding `ReleaseShutdownLock()`
 2. **Use defer**: Always use `defer em.ReleaseShutdownLock()` immediately after acquiring a lock
 3. **Check lock acquisition**: Always check the error from `AcquireShutdownLock()`
+5. **Set timeouts**: Use `SetTimeout()` to avoid hanging during process shutdown
 4. **Quick cleanup**: Keep cleanup functions fast and non-blocking
-5. **Set timeouts**: Use `SetTimeout()` to prevent hanging during shutdown
-6. **Monitor locks**: Use `Locks()` for debugging shutdown issues
-
-## Error Handling
-
-The exit manager handles several error conditions gracefully:
-
-- **Double shutdown**: Multiple calls to `Shutdown()` are safe
-- **Lock after shutdown**: `AcquireShutdownLock()` returns error if shutdown initiated
-- **Unmatched releases**: Extra calls to `ReleaseShutdownLock()` are safe (but indicate bugs)
-- **Timeout exceeded**: Process exits with code 1 if timeout expires
 
 ## Contributing
 
