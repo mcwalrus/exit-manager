@@ -44,6 +44,20 @@ func checkManagerExitCode(t *testing.T, em *ExitManager, code int) {
 func TestNotify(t *testing.T) {
 	t.Parallel()
 
+	t.Run("wait for Shutdown()", func(t *testing.T) {
+		em := newExitManager()
+		go em.listenForSignals()
+		em.hijackExitHandler()
+
+		select {
+		case <-em.Notify():
+			t.Fatalf("needed to wait for Shutdown() by exit handler")
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		em.Shutdown()
+	})
+
 	t.Run("multiple listeners", func(t *testing.T) {
 		em := newExitManager()
 		go em.listenForSignals()
