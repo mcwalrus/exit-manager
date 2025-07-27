@@ -68,6 +68,7 @@ type ExitManager struct {
 	shutdown chan struct{}
 	serverWg *sync.WaitGroup
 	cleanups []func()
+	exit     exitHandler
 }
 
 var (
@@ -75,7 +76,32 @@ var (
 	manager *ExitManager
 )
 
-// Global returns the ExitManager.
+// newExitManager returns a new exit manager instance.
+func newExitManager() *ExitManager {
+	return &ExitManager{
+		mu:       &sync.RWMutex{},
+		locksCh:  make(chan struct{}),
+		notifyCh: make(chan struct{}),
+		shutdown: make(chan struct{}),
+		serverWg: &sync.WaitGroup{},
+		exit:     osExitHandler{},
+	}
+}
+
+// exitHandler provides the interface to exit the application.
+// This interface type can be replace or hijacked for testing.
+type exitHandler interface {
+	Exit(code int)
+}
+
+// osExitHandler implements the exitHandler with "os" handling.
+type osExitHandler struct{}
+
+func (ehi osExitHandler) Exit(code int) {
+	os.Exit(code)
+}
+
+// Global returns the global ExitManager instance.
 //
 // The first call to Global creates a singleton exit manager and starts listening for
 // SIGINT and SIGTERM signals. The exit manager to be safely accessed from anywhere in
@@ -89,13 +115,7 @@ var (
 //	})
 func Global() *ExitManager {
 	once.Do(func() {
-		em := &ExitManager{
-			mu:       &sync.RWMutex{},
-			locksCh:  make(chan struct{}),
-			notifyCh: make(chan struct{}),
-			shutdown: make(chan struct{}),
-			serverWg: &sync.WaitGroup{},
-		}
+		em := newExitManager()
 		go em.listenForSignals()
 		manager = em
 	})
@@ -394,14 +414,14 @@ func (em *ExitManager) listenForSignals() {
 	// no timeout
 	if em.timeout <= 0 {
 		<-done
-		os.Exit(0)
+		em.exit.Exit(0)
 	}
 
 	// timeout set
 	select {
 	case <-done:
-		os.Exit(0)
+		em.exit.Exit(0)
 	case <-time.After(em.timeout):
-		os.Exit(1)
+		em.exit.Exit(1)
 	}
 }
