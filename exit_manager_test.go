@@ -7,6 +7,21 @@ import (
 	"time"
 )
 
+// newTestExitManager returns a hijacked test ExitManager.
+// This avoids the case where the ExitManager will call os.Exit(code) during tests.
+// You can also record the exit manager exit code with the registed exitHandlerRecorder set.
+// While testing, please call em.Shutdown() to cleanup after em.listenForSignals().
+func newTestExitManager() *ExitManager {
+	em := newExitManager()
+	go em.listenForSignals()
+	em.hijackExitHandler()
+	return em
+}
+
+func (em *ExitManager) hijackExitHandler() {
+	em.exit = &exitHandlerRecorder{}
+}
+
 // exitHandlerRecorder records the exit manager on leaving.
 type exitHandlerRecorder struct {
 	code      int
@@ -18,10 +33,7 @@ func (ehr *exitHandlerRecorder) Exit(code int) {
 	ehr.hasExited = true
 }
 
-func (em *ExitManager) hijackExitHandler() {
-	em.exit = &exitHandlerRecorder{}
-}
-
+// checkManagerExitCode tests for the expected exit code from a hijacked exit manager.
 func checkManagerExitCode(t *testing.T, em *ExitManager, code int) {
 	t.Helper()
 
@@ -45,9 +57,7 @@ func TestNotify(t *testing.T) {
 	t.Parallel()
 
 	t.Run("wait for Shutdown()", func(t *testing.T) {
-		em := newExitManager()
-		go em.listenForSignals()
-		em.hijackExitHandler()
+		em := newTestExitManager()
 
 		select {
 		case <-em.Notify():
@@ -58,10 +68,21 @@ func TestNotify(t *testing.T) {
 		em.Shutdown()
 	})
 
+	t.Run("listen after Shutdown()", func(t *testing.T) {
+		em := newTestExitManager()
+
+		em.Shutdown()
+		select {
+		case <-em.Notify():
+		case <-time.After(10 * time.Millisecond):
+			t.Fatal("Notify() channel was not closed after Shutdown()")
+		}
+
+		checkManagerExitCode(t, em, 0)
+	})
+
 	t.Run("multiple listeners", func(t *testing.T) {
-		em := newExitManager()
-		go em.listenForSignals()
-		em.hijackExitHandler()
+		em := newTestExitManager()
 
 		wg := &sync.WaitGroup{}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -86,21 +107,6 @@ func TestNotify(t *testing.T) {
 		case <-ctx.Done():
 			t.Errorf("context cancelled before all routinues were notified")
 		default:
-		}
-
-		checkManagerExitCode(t, em, 0)
-	})
-
-	t.Run("listen after Shutdown()", func(t *testing.T) {
-		em := newExitManager()
-		go em.listenForSignals()
-		em.hijackExitHandler()
-
-		em.Shutdown()
-		select {
-		case <-em.Notify():
-		case <-time.After(10 * time.Millisecond):
-			t.Fatal("Notify() channel was not closed after Shutdown()")
 		}
 
 		checkManagerExitCode(t, em, 0)

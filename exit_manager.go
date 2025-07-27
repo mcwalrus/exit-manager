@@ -294,6 +294,9 @@ func (em *ExitManager) RegisterHTTPServer(server *http.Server, timeout time.Dura
 //  2. Wait for all shutdown locks to be released
 //  3. Execute cleanup functions in reverse registration order
 //  4. Exit the process
+//
+// Note the Shutdown method is non-blocking so you will have to wait if called on the main
+// routine.
 func (em *ExitManager) Shutdown() {
 	em.mu.Lock()
 	select {
