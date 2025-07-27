@@ -38,6 +38,7 @@ package exitmanager
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"os/signal"
 	"slices"
@@ -58,13 +59,14 @@ import (
 // return the number of locks held, and cancel any registered contexts on
 // shutdown.
 type ExitManager struct {
-	mu       *sync.Mutex
+	mu       *sync.RWMutex
 	locks    int
 	notified bool
 	timeout  time.Duration
 	locksCh  chan struct{}
 	notifyCh chan struct{}
 	shutdown chan struct{}
+	serverWg *sync.WaitGroup
 	cleanups []func()
 }
 
@@ -88,10 +90,11 @@ var (
 func Global() *ExitManager {
 	once.Do(func() {
 		em := &ExitManager{
-			mu:       &sync.Mutex{},
+			mu:       &sync.RWMutex{},
 			locksCh:  make(chan struct{}),
 			notifyCh: make(chan struct{}),
 			shutdown: make(chan struct{}),
+			serverWg: &sync.WaitGroup{},
 		}
 		go em.listenForSignals()
 		manager = em
@@ -224,6 +227,45 @@ func (em *ExitManager) Notify() <-chan struct{} {
 	return em.notifyCh
 }
 
+type ShutdownErrorHandler func(err error)
+
+// RegisterHTTPServer registers a http.Server to exit on notified event.
+// The exit manager will wait until all servers have shutdown successfully before shutting down.
+// If the error return by the call to server.Shutdown is other than http.ErrServerClosed, handleErr should take appropriate action.
+// The method will panic if handleErr is nil.
+func (em *ExitManager) RegisterHTTPServer(server *http.Server, timeout time.Duration, handleErr ShutdownErrorHandler) {
+	if handleErr == nil {
+		panic("exit-manager: no http.Server.Shutdown() handleErr func provided")
+	}
+
+	// consider when exit manager is already notified
+	em.mu.RLock()
+	if em.notified {
+		em.mu.RUnlock()
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		err := server.Shutdown(ctx)
+		if !errors.Is(err, http.ErrServerClosed) {
+			handleErr(err)
+		}
+		return
+	}
+	em.mu.RUnlock()
+
+	// configure graceful exit for server for when notified
+	em.serverWg.Add(1)
+	go func() {
+		<-em.Notify()
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		err := server.Shutdown(ctx)
+		if !errors.Is(err, http.ErrServerClosed) {
+			handleErr(err)
+		}
+		em.serverWg.Done()
+	}()
+}
+
 // Shutdown programmatically initiates the shutdown process.
 // This has the same effect as receiving a SIGINT or SIGTERM signal.
 // The method can be called multiple times safely where subsequent calls have no effect.
@@ -294,10 +336,13 @@ func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 
+	em.mu.RLock()
 	if em.notified {
+		em.mu.RUnlock()
 		cancel()
 		return ctx, cancel
 	}
+	em.mu.RUnlock()
 
 	once := sync.Once{}
 	cleanup := func() {
@@ -338,6 +383,7 @@ func (em *ExitManager) listenForSignals() {
 		for em.locks > 0 {
 			<-em.locksCh
 		}
+		em.serverWg.Wait()
 		cleanups := append([]func(){}, em.cleanups...)
 		slices.Reverse(cleanups)
 		for _, f := range cleanups {
