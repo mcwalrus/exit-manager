@@ -112,3 +112,75 @@ func TestNotify(t *testing.T) {
 		checkManagerExitCode(t, em, 0)
 	})
 }
+
+func TestWithCancel(t *testing.T) {
+	t.Parallel()
+
+	t.Run("context cancellation waits for notified shutdown", func(t *testing.T) {
+		em := newTestExitManager()
+		ctx, cancel := em.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		select {
+		case <-ctx.Done():
+			t.Fatal("context should not be cancelled before shutdown")
+		case <-time.After(10 * time.Millisecond):
+		}
+
+		em.Shutdown()
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("context was not cancelled after shutdown")
+		}
+		checkManagerExitCode(t, em, 0)
+	})
+
+	t.Run("context is returned cancelled on notified exit manager", func(t *testing.T) {
+		em := newTestExitManager()
+		em.Shutdown()
+		ctx, cancel := em.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		select {
+		case <-ctx.Done():
+			// expected
+		case <-time.After(10 * time.Millisecond):
+			t.Fatal("context should be immediately cancelled if shutdown already occurred")
+		}
+		checkManagerExitCode(t, em, 0)
+	})
+
+	t.Run("mutliple contexts cancelled", func(t *testing.T) {
+		em := newTestExitManager()
+		ctx1, cancel1 := em.WithCancel(context.Background())
+		ctx2, cancel2 := em.WithCancel(context.Background())
+		t.Cleanup(cancel1)
+		t.Cleanup(cancel2)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx1.Done():
+			case <-time.After(100 * time.Millisecond):
+				t.Error("ctx1 was not cancelled after shutdown")
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx2.Done():
+			case <-time.After(100 * time.Millisecond):
+				t.Error("ctx2 was not cancelled after shutdown")
+			}
+		}()
+
+		em.Shutdown()
+		wg.Wait()
+		checkManagerExitCode(t, em, 0)
+	})
+}
