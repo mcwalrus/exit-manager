@@ -247,12 +247,11 @@ func (em *ExitManager) Notify() <-chan struct{} {
 	return em.notifyCh
 }
 
-type ShutdownErrorHandler func(err error)
-
 // RegisterHTTPServer registers a http.Server to exit on notified event.
 // The exit manager will wait until all servers have shutdown successfully before shutting down.
 // If the error return by the call to server.Shutdown is other than http.ErrServerClosed, handleErr should take appropriate action.
-func (em *ExitManager) RegisterHTTPServer(server *http.Server, timeout time.Duration, handleErr ShutdownErrorHandler) {
+// If the exit manager is already notified, the server will be shutdown immediately. Timeout can be ignored if 0 or less.
+func (em *ExitManager) RegisterHTTPServer(server *http.Server, timeout time.Duration, handleErr func(err error)) {
 	if handleErr == nil {
 		handleErr = func(err error) {}
 	}
@@ -261,8 +260,14 @@ func (em *ExitManager) RegisterHTTPServer(server *http.Server, timeout time.Dura
 	em.mu.RLock()
 	if em.notified {
 		em.mu.RUnlock()
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
+
+		ctx := context.Background()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+		}
+
 		err := server.Shutdown(ctx)
 		if !errors.Is(err, http.ErrServerClosed) {
 			handleErr(err)
@@ -275,8 +280,14 @@ func (em *ExitManager) RegisterHTTPServer(server *http.Server, timeout time.Dura
 	em.serverWg.Add(1)
 	go func() {
 		<-em.Notify()
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
+
+		ctx := context.Background()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+		}
+
 		err := server.Shutdown(ctx)
 		if !errors.Is(err, http.ErrServerClosed) {
 			handleErr(err)
