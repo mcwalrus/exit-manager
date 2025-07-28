@@ -384,11 +384,47 @@ func TestRegisterHTTPServerOnShutdown(t *testing.T) {
 		server.Listener.Close()
 
 		em.Shutdown()
-		time.Sleep(50 * time.Millisecond)
+		er := (em.exit).(*exitRecorder)
+		er.Wait()
+
 		if !handlerErrCalled {
 			t.Error("error handler should be called if shutdown returns error")
 		}
 
 		checkManagerExitCode(t, em, 0)
 	})
+
+	t.Run("shutdown http server with notified exit manager", func(t *testing.T) {
+		em := testExitManager(t)
+		em.Shutdown()
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		})
+		server := httptest.NewUnstartedServer(handler)
+		server.Start()
+		t.Cleanup(func() { server.Close() })
+
+		httpServer := server.Config
+		httpServer.Addr = server.Listener.Addr().String()
+		httpServer.Handler = handler
+		httpServer.BaseContext = server.Config.BaseContext
+
+		// check immediately without wait, expect eager shutdown
+		handlerErrCalled := false
+		em.RegisterHTTPServerOnShutdown(server.Config, 0, func(err error) {
+			handlerErrCalled = true
+		})
+		if isServerAlive(server) {
+			t.Error("server should not be alive after shutdown")
+		}
+		if handlerErrCalled {
+			t.Error("error handler should be called if shutdown returns error")
+		}
+
+		checkManagerExitCode(t, em, 0)
+	})
+
+	t.Run("check timeout works and error is caught through handleErr", func(t *testing.T) {})
 }

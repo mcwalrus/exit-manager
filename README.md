@@ -5,12 +5,12 @@
 ## Key Features
 
 - 🛡️ **Safe Shutdown**: Prevents shutdown during critical operations using locks
-- 🔄 **Signal Handling**: Automatically listens for SIGINT/SIGTERM signals
+- 🔄 **Signal Handling**: Automatically listens for SIGINT/SIGTERM or shutdown signals
+- 🎯 **Context Integration**: Register cancellation contexts on notified shutdown
 - 🧹 **Cleanup Coordination**: Executes cleanup functions in reverse registration order
+- 📡 **Shutdown Notifications**: Notify goroutines when notified shutdown begins
+- **Server Registrations**: Handles graceful server shutdown before coordinated cleanup
 - ⏱️ **Timeout Support**: Configurable forced exit after timeout
-- 📡 **Shutdown Notifications**: Notify goroutines when shutdown begins
-- 🎯 **Context Integration**: Automatic context cancellation on shutdown
-- 🏗️ **Singleton Pattern**: Global access from anywhere in your application
 
 ## Installation
 

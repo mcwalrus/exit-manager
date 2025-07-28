@@ -62,6 +62,7 @@ type ExitManager struct {
 	mu       *sync.RWMutex
 	locks    int
 	notified bool
+	once     *sync.Once
 	timeout  time.Duration
 	locksCh  chan struct{}
 	notifyCh chan struct{}
@@ -80,6 +81,7 @@ var (
 func newExitManager() *ExitManager {
 	return &ExitManager{
 		mu:       &sync.RWMutex{},
+		once:     &sync.Once{},
 		locksCh:  make(chan struct{}),
 		notifyCh: make(chan struct{}),
 		shutdown: make(chan struct{}),
@@ -406,36 +408,39 @@ func (em *ExitManager) listenForSignals() {
 	case <-em.shutdown:
 	}
 
-	em.mu.Lock()
-	em.notified = true
-	close(em.notifyCh)
-	em.mu.Unlock()
+	em.once.Do(func() {
+		em.mu.Lock()
+		em.notified = true
+		close(em.notifyCh)
+		em.mu.Unlock()
 
-	done := make(chan struct{})
-	go func() {
-		for em.locks > 0 {
-			<-em.locksCh
+		done := make(chan struct{})
+		go func() {
+			for em.locks > 0 {
+				<-em.locksCh
+			}
+			em.serverWg.Wait()
+			cleanups := append([]func(){}, em.cleanups...)
+			slices.Reverse(cleanups)
+			for _, f := range cleanups {
+				f()
+			}
+			close(done)
+		}()
+
+		// no timeout
+		if em.timeout <= 0 {
+			<-done
+			em.exit.Exit(0)
+			return
 		}
-		em.serverWg.Wait()
-		cleanups := append([]func(){}, em.cleanups...)
-		slices.Reverse(cleanups)
-		for _, f := range cleanups {
-			f()
+
+		// timeout set
+		select {
+		case <-done:
+			em.exit.Exit(0)
+		case <-time.After(em.timeout):
+			em.exit.Exit(1)
 		}
-		close(done)
-	}()
-
-	// no timeout
-	if em.timeout <= 0 {
-		<-done
-		em.exit.Exit(0)
-	}
-
-	// timeout set
-	select {
-	case <-done:
-		em.exit.Exit(0)
-	case <-time.After(em.timeout):
-		em.exit.Exit(1)
-	}
+	})
 }
