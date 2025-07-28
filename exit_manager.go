@@ -269,7 +269,7 @@ func (em *ExitManager) RegisterHTTPServerOnShutdown(server *http.Server, timeout
 		}
 
 		err := server.Shutdown(ctx)
-		if !errors.Is(err, http.ErrServerClosed) {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			handleErr(err)
 		}
 		return
@@ -289,7 +289,7 @@ func (em *ExitManager) RegisterHTTPServerOnShutdown(server *http.Server, timeout
 		}
 
 		err := server.Shutdown(ctx)
-		if !errors.Is(err, http.ErrServerClosed) {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			handleErr(err)
 		}
 		em.serverWg.Done()
