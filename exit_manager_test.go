@@ -2,6 +2,7 @@ package exitmanager
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -39,6 +40,7 @@ type exitRecorder struct {
 	mu          *sync.Mutex
 	code        int
 	nExits      int
+	notified    bool
 	hasExited   bool
 	hasExitedCh chan (struct{})
 }
@@ -56,6 +58,9 @@ func (er *exitRecorder) Exit(code int) {
 // Wait blocks until the exit handler has returned.
 func (er *exitRecorder) Wait() {
 	<-er.hasExitedCh
+	er.mu.Lock()
+	er.notified = true
+	er.mu.Unlock()
 }
 
 // checkManagerExitCode tests for the expected exit code from a hijacked exit manager.
@@ -388,7 +393,7 @@ func TestRegisterHTTPServerOnShutdown(t *testing.T) {
 		er.Wait()
 
 		if !handlerErrCalled {
-			t.Error("error handler should be called if shutdown returns error")
+			t.Error("error handler should be called if shutdown returns error") // TODO: Race condition!
 		}
 
 		checkManagerExitCode(t, em, 0)
@@ -426,5 +431,55 @@ func TestRegisterHTTPServerOnShutdown(t *testing.T) {
 		checkManagerExitCode(t, em, 0)
 	})
 
-	t.Run("check timeout works and error is caught through handleErr", func(t *testing.T) {})
+	t.Run("check timeout works catching context.DeadlineExceeded on shutdown", func(t *testing.T) {
+		em := testExitManager(t)
+
+		// Block until test releases
+		blockCh := make(chan struct{})
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-blockCh
+		})
+
+		server := httptest.NewUnstartedServer(handler)
+		server.Start()
+		t.Cleanup(func() { server.Close() })
+
+		httpServer := server.Config
+		httpServer.Addr = server.Listener.Addr().String()
+		httpServer.Handler = handler
+		httpServer.BaseContext = server.Config.BaseContext
+
+		// Register http.Server with short shutdown timeout
+		errCh := make(chan error, 1)
+		em.RegisterHTTPServerOnShutdown(server.Config, 10*time.Millisecond, func(err error) {
+			errCh <- err
+		})
+
+		// Start a request that will block, wait for handler start and block
+		done := make(chan struct{})
+		go func() {
+			makeRequest(t, server.URL, http.StatusOK)
+			close(done)
+		}()
+		time.Sleep(20 * time.Millisecond)
+		em.Shutdown()
+
+		// Catch context.DeadlineExceeded within registered shutdown timeout
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Error("expected deadline error due to shutdown timeout")
+			}
+		case <-time.After(200 * time.Millisecond):
+			t.Error("timeout occurred waiting for handleErr to be called")
+		}
+
+		// Unblock the handler to let the go-routine finish
+		close(blockCh)
+		<-done
+
+		checkManagerExitCode(t, em, 0)
+	})
 }
