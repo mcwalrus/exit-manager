@@ -2,6 +2,9 @@ package exitmanager
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -185,22 +188,175 @@ func TestWithCancel(t *testing.T) {
 	})
 }
 
+func isServerAlive(server *httptest.Server) bool {
+	resp, err := http.Get(server.URL)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func makeRequest(t *testing.T, url string, expectStatus int) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("failed to make request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != expectStatus {
+		t.Errorf("unexpected status: got %d, want %d", resp.StatusCode, expectStatus)
+	}
+	_, _ = io.ReadAll(resp.Body)
+}
+
 func TestRegisterHTTPServerOnShutdown(t *testing.T) {
 	t.Parallel()
-	// check exit codes after all shutdown events after tests complete.
 
 	t.Run("shutdown http server", func(t *testing.T) {
-		// check the server cannot take new connections after shutdown.
+		em := newTestExitManager()
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		})
+		server := httptest.NewUnstartedServer(handler)
+		server.Start()
+		t.Cleanup(func() { server.Close() })
+
+		httpServer := server.Config
+		httpServer.Addr = server.Listener.Addr().String()
+		httpServer.Handler = handler
+		httpServer.BaseContext = server.Config.BaseContext
+
+		em.RegisterHTTPServerOnShutdown(server.Config, 0, nil)
+
+		if !isServerAlive(server) {
+			t.Fatal("server should be alive before shutdown")
+		}
+
+		em.Shutdown()
+		time.Sleep(50 * time.Millisecond)
+
+		if isServerAlive(server) {
+			t.Error("server should not be alive after shutdown")
+		}
+
+		checkManagerExitCode(t, em, 0)
 	})
+
 	t.Run("shutdown http server with on-going connections", func(t *testing.T) {
-		// check connections are returned gracefully.
+		em := newTestExitManager()
+
+		blockCh := make(chan struct{})
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-blockCh // block until shutdown
+		})
+
+		server := httptest.NewUnstartedServer(handler)
+		server.Start()
+		t.Cleanup(func() { server.Close() })
+
+		httpServer := server.Config
+		httpServer.Addr = server.Listener.Addr().String()
+		httpServer.Handler = handler
+		httpServer.BaseContext = server.Config.BaseContext
+		em.RegisterHTTPServerOnShutdown(httpServer, 0, nil)
+
+		done := make(chan struct{})
+		go func() {
+			makeRequest(t, server.URL, http.StatusOK)
+			close(done)
+		}()
+
+		// ensure request is in-flight, allow handler to finish
+		time.Sleep(20 * time.Millisecond)
+		em.Shutdown()
+		close(blockCh)
+		<-done
+
+		if isServerAlive(server) {
+			t.Error("server should not be alive after shutdown")
+		}
+
+		checkManagerExitCode(t, em, 0)
 	})
 
 	t.Run("shutdown multiple http servers", func(t *testing.T) {
-		// check all servers cannot take new connections after shutdown.
+		em := newTestExitManager()
+		servers := []*httptest.Server{}
+
+		// register test servers
+		for i := 0; i < 2; i++ {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("ok"))
+			})
+
+			server := httptest.NewUnstartedServer(handler)
+			server.Start()
+			t.Cleanup(func() { server.Close() })
+
+			httpServer := server.Config
+			httpServer.Addr = server.Listener.Addr().String()
+			httpServer.Handler = handler
+			httpServer.BaseContext = server.Config.BaseContext
+
+			em.RegisterHTTPServerOnShutdown(server.Config, 0, nil)
+			servers = append(servers, server)
+		}
+
+		// check availabity
+		for _, server := range servers {
+			if !isServerAlive(server) {
+				t.Fatal("server should be alive before shutdown")
+			}
+		}
+
+		em.Shutdown()
+		time.Sleep(50 * time.Millisecond)
+
+		for _, server := range servers {
+			if isServerAlive(server) {
+				t.Error("server should not be alive after shutdown")
+			}
+		}
+
+		checkManagerExitCode(t, em, 0)
 	})
 
-	t.Run("shutdown multiple http servers", func(t *testing.T) {
-		// check all servers cannot take new connections after shutdown.
+	t.Run("shutdown http server error handling", func(t *testing.T) {
+		em := newTestExitManager()
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		})
+		server := httptest.NewUnstartedServer(handler)
+		server.Start()
+		t.Cleanup(func() { server.Close() })
+
+		httpServer := server.Config
+		httpServer.Addr = server.Listener.Addr().String()
+		httpServer.Handler = handler
+		httpServer.BaseContext = server.Config.BaseContext
+
+		handlerErrCalled := false
+		em.RegisterHTTPServerOnShutdown(server.Config, 0, func(err error) {
+			handlerErrCalled = true
+		})
+
+		// Close the server listener to force an error on shutdown
+		server.Listener.Close()
+
+		em.Shutdown()
+		time.Sleep(50 * time.Millisecond)
+		if !handlerErrCalled {
+			t.Error("error handler should be called if shutdown returns error")
+		}
+
+		checkManagerExitCode(t, em, 0)
 	})
 }
