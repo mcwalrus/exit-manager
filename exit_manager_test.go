@@ -13,45 +13,69 @@ import (
 // newTestExitManager returns a hijacked test ExitManager.
 // This avoids the case where the ExitManager will call os.Exit(code) during tests.
 // You can also record the exit manager exit code with the registed exitHandlerRecorder set.
-// While testing, please call em.Shutdown() to cleanup after em.listenForSignals().
-func newTestExitManager() *ExitManager {
+func testExitManager(t *testing.T) *ExitManager {
+	t.Helper()
+
 	em := newExitManager()
 	go em.listenForSignals()
 	em.hijackExitHandler()
+
+	t.Cleanup(func() {
+		em.Shutdown()
+	})
+
 	return em
 }
 
 func (em *ExitManager) hijackExitHandler() {
-	em.exit = &exitHandlerRecorder{}
+	em.exit = &exitRecorder{
+		mu:          &sync.Mutex{},
+		hasExitedCh: make(chan struct{}),
+	}
 }
 
-// exitHandlerRecorder records the exit manager on leaving.
-type exitHandlerRecorder struct {
-	code      int
-	hasExited bool
+// exitRecorder records the exit manager on leaving.
+type exitRecorder struct {
+	mu          *sync.Mutex
+	code        int
+	nExits      int
+	hasExited   bool
+	hasExitedCh chan (struct{})
 }
 
-func (ehr *exitHandlerRecorder) Exit(code int) {
-	ehr.code = code
-	ehr.hasExited = true
+// Exit implements the exitHandler interface.
+func (er *exitRecorder) Exit(code int) {
+	er.mu.Lock()
+	er.nExits++
+	er.code = code
+	er.hasExited = true
+	close(er.hasExitedCh)
+	er.mu.Unlock()
+}
+
+// Wait blocks until the exit handler has returned.
+func (er *exitRecorder) Wait() {
+	<-er.hasExitedCh
 }
 
 // checkManagerExitCode tests for the expected exit code from a hijacked exit manager.
 func checkManagerExitCode(t *testing.T, em *ExitManager, code int) {
 	t.Helper()
 
-	ehr, ok := (em.exit).(*exitHandlerRecorder)
+	er, ok := (em.exit).(*exitRecorder)
 	if !ok {
 		t.Fatalf("required em.hijackExitHandler() for test")
 	}
+	er.mu.Lock()
+	defer er.mu.Unlock()
 
-	if !ehr.hasExited {
+	if !er.hasExited {
 		t.Errorf("exit manager has not been recorded to exit yet...")
 		t.FailNow()
 	}
 
-	if ehr.code != code {
-		t.Errorf("exit manager returned different exit code: %d != %d (recorded, expected)", ehr.code, code)
+	if er.code != code {
+		t.Errorf("exit manager returned different exit code: %d != %d (recorded, expected)", er.code, code)
 		t.FailNow()
 	}
 }
@@ -60,7 +84,7 @@ func TestNotify(t *testing.T) {
 	t.Parallel()
 
 	t.Run("wait for Shutdown()", func(t *testing.T) {
-		em := newTestExitManager()
+		em := testExitManager(t)
 
 		select {
 		case <-em.Notify():
@@ -72,7 +96,7 @@ func TestNotify(t *testing.T) {
 	})
 
 	t.Run("listen after Shutdown()", func(t *testing.T) {
-		em := newTestExitManager()
+		em := testExitManager(t)
 
 		em.Shutdown()
 		select {
@@ -85,7 +109,7 @@ func TestNotify(t *testing.T) {
 	})
 
 	t.Run("multiple listeners", func(t *testing.T) {
-		em := newTestExitManager()
+		em := testExitManager(t)
 
 		wg := &sync.WaitGroup{}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -120,7 +144,7 @@ func TestWithCancel(t *testing.T) {
 	t.Parallel()
 
 	t.Run("context cancellation waits for notified shutdown", func(t *testing.T) {
-		em := newTestExitManager()
+		em := testExitManager(t)
 		ctx, cancel := em.WithCancel(context.Background())
 		t.Cleanup(cancel)
 
@@ -141,7 +165,7 @@ func TestWithCancel(t *testing.T) {
 	})
 
 	t.Run("context is returned cancelled on notified exit manager", func(t *testing.T) {
-		em := newTestExitManager()
+		em := testExitManager(t)
 		em.Shutdown()
 		ctx, cancel := em.WithCancel(context.Background())
 		t.Cleanup(cancel)
@@ -156,7 +180,7 @@ func TestWithCancel(t *testing.T) {
 	})
 
 	t.Run("mutliple contexts cancelled", func(t *testing.T) {
-		em := newTestExitManager()
+		em := testExitManager(t)
 		ctx1, cancel1 := em.WithCancel(context.Background())
 		ctx2, cancel2 := em.WithCancel(context.Background())
 		t.Cleanup(cancel1)
@@ -214,7 +238,7 @@ func TestRegisterHTTPServerOnShutdown(t *testing.T) {
 	t.Parallel()
 
 	t.Run("shutdown http server", func(t *testing.T) {
-		em := newTestExitManager()
+		em := testExitManager(t)
 
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
@@ -229,24 +253,31 @@ func TestRegisterHTTPServerOnShutdown(t *testing.T) {
 		httpServer.Handler = handler
 		httpServer.BaseContext = server.Config.BaseContext
 
-		em.RegisterHTTPServerOnShutdown(server.Config, 0, nil)
+		handlerErrCalled := false
+		em.RegisterHTTPServerOnShutdown(server.Config, 0, func(err error) {
+			handlerErrCalled = true
+		})
 
 		if !isServerAlive(server) {
 			t.Fatal("server should be alive before shutdown")
 		}
 
 		em.Shutdown()
-		time.Sleep(50 * time.Millisecond)
+		er := (em.exit).(*exitRecorder)
+		er.Wait()
 
 		if isServerAlive(server) {
 			t.Error("server should not be alive after shutdown")
+		}
+		if handlerErrCalled {
+			t.Error("http server shutdown should not call handleErr")
 		}
 
 		checkManagerExitCode(t, em, 0)
 	})
 
 	t.Run("shutdown http server with on-going connections", func(t *testing.T) {
-		em := newTestExitManager()
+		em := testExitManager(t)
 
 		blockCh := make(chan struct{})
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -263,7 +294,7 @@ func TestRegisterHTTPServerOnShutdown(t *testing.T) {
 		httpServer.Addr = server.Listener.Addr().String()
 		httpServer.Handler = handler
 		httpServer.BaseContext = server.Config.BaseContext
-		em.RegisterHTTPServerOnShutdown(httpServer, 0, nil)
+		em.RegisterHTTPServerOnShutdown(server.Config, 0, nil)
 
 		done := make(chan struct{})
 		go func() {
@@ -285,7 +316,7 @@ func TestRegisterHTTPServerOnShutdown(t *testing.T) {
 	})
 
 	t.Run("shutdown multiple http servers", func(t *testing.T) {
-		em := newTestExitManager()
+		em := testExitManager(t)
 		servers := []*httptest.Server{}
 
 		// register test servers
@@ -316,7 +347,8 @@ func TestRegisterHTTPServerOnShutdown(t *testing.T) {
 		}
 
 		em.Shutdown()
-		time.Sleep(50 * time.Millisecond)
+		er := (em.exit).(*exitRecorder)
+		er.Wait()
 
 		for _, server := range servers {
 			if isServerAlive(server) {
@@ -328,7 +360,7 @@ func TestRegisterHTTPServerOnShutdown(t *testing.T) {
 	})
 
 	t.Run("shutdown http server error handling", func(t *testing.T) {
-		em := newTestExitManager()
+		em := testExitManager(t)
 
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
