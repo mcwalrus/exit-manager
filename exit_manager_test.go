@@ -184,3 +184,23 @@ func TestWithCancel(t *testing.T) {
 		checkManagerExitCode(t, em, 0)
 	})
 }
+
+func TestRegisterHTTPServerOnShutdown(t *testing.T) {
+	t.Parallel()
+	// check exit codes after all shutdown events after tests complete.
+
+	t.Run("shutdown http server", func(t *testing.T) {
+		// check the server cannot take new connections after shutdown.
+	})
+	t.Run("shutdown http server with on-going connections", func(t *testing.T) {
+		// check connections are returned gracefully.
+	})
+
+	t.Run("shutdown multiple http servers", func(t *testing.T) {
+		// check all servers cannot take new connections after shutdown.
+	})
+
+	t.Run("shutdown multiple http servers", func(t *testing.T) {
+		// check all servers cannot take new connections after shutdown.
+	})
+}

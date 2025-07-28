@@ -247,11 +247,11 @@ func (em *ExitManager) Notify() <-chan struct{} {
 	return em.notifyCh
 }
 
-// RegisterHTTPServer registers a http.Server to exit on notified event.
+// RegisterHTTPServerOnShutdown registers a http.Server to Shutdown on notified event.
 // The exit manager will wait until all servers have shutdown successfully before shutting down.
 // If the error return by the call to server.Shutdown is other than http.ErrServerClosed, handleErr should take appropriate action.
 // If the exit manager is already notified, the server will be shutdown immediately. Timeout can be ignored if 0 or less.
-func (em *ExitManager) RegisterHTTPServer(server *http.Server, timeout time.Duration, handleErr func(err error)) {
+func (em *ExitManager) RegisterHTTPServerOnShutdown(server *http.Server, timeout time.Duration, handleErr func(err error)) {
 	if handleErr == nil {
 		handleErr = func(err error) {}
 	}
