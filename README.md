@@ -43,61 +43,62 @@ Use exit-manager when you need to guarantee or manage cleanup functions execute 
 package main
 
 import (
-    "log"
-    "time"
-    "github.com/mcwalrus/exit-manager"
+	"log"
+	"time"
+
+	exitmanager "github.com/mcwalrus/exit-manager"
 )
 
 func main() {
-    em := exitmanager.Global()
+	em := exitmanager.Global()
 
-    // Register cleanup functions
-    em.RegisterCleanup(func() {
-        log.Println("Closing database connections...")
-    })
+	// Register cleanup functions
+	em.RegisterCleanup(func() {
+		log.Println("Closing database connections...")
+	})
 
-    em.RegisterCleanup(func() {
-        log.Println("Stopping background workers...")
-    })
+	em.RegisterCleanup(func() {
+		log.Println("Stopping background workers...")
+	})
 
-    // Set a timeout for forced shutdown
-    em.SetTimeout(30 * time.Second)
+	// Set a timeout for forced shutdown
+	em.SetTimeout(30 * time.Second)
 
-    // Shutdown process after sleep
-    go func () {
-        time.Sleep(10 * time.Second)
-        em.Shutdown()
-    }()
+	// Shutdown process after sleep
+	go func() {
+		time.Sleep(10 * time.Second)
+		em.Shutdown()
+        log.Println("Shutdown has occurred on main routine")
+	}()
 
-    for {
-        // Protect critical operation
-        if err := em.AcquireShutdownLock(); err == nil {
-            log.Printf("Worker: shutdown in progress, exiting", id)
-            
-        }
-        // Simulate work release lock
-        log.Printf("Worker: processing...", id)
-        time.Sleep(2 * time.Second)
-        em.ReleaseShutdownLock()
-        
-        // Check for notified shutdown
-        select {
-        case <-em.Notify():
-            log.Printf("Worker: received shutdown signal", id)
-            break
-        default:
-            // Continue working
-        }
-    }
-    
-    // Wait forever, exit-manager to exit process
-    select {}
+	for {
+		// Protect critical operation
+		if err := em.AcquireShutdownLock(); err != nil {
+			log.Printf("Worker: shutdown in progress, exiting")
+			return
+		}
+		// Simulate work release lock
+		log.Printf("Worker: processing...")
+		time.Sleep(2 * time.Second)
+		em.ReleaseShutdownLock()
+
+		// Check for notified shutdown
+		select {
+		case <-em.Notify():
+			log.Printf("Worker: received shutdown signal")
+			return
+		default:
+			// Continue working
+		}
+	}
 }
 ```
 
-### Acquiring Shutdown Locks
+### Shutdown Locks
 
-You can acquire multiple shutdown locks at once for critical operations.
+You can acquire multiple shutdown locks at once to protect critical operations from the process shutdown.
+
+The exit manager will only exit the process once all remaining locks are released:
 
 ```go
 package main
@@ -105,7 +106,8 @@ package main
 import (
     "log"
     "time"
-    "github.com/mcwalrus/exit-manager"
+    
+    exitmanager "github.com/mcwalrus/exit-manager"
 )
 
 func main() {
@@ -115,6 +117,7 @@ func main() {
     go func () {
         time.Sleep(10 * time.Second)
         em.Shutdown()
+        log.Println("Shutdown has occurred on main routine")
     }()
 
     // Start worker goroutines
@@ -142,7 +145,7 @@ func doWork(id int) {
         
         // Simulate work, release lock
         log.Printf("Worker %d: processing...", id)
-        time.Sleep(2.34 * time.Second)
+        time.Sleep(3 * time.Second)
         em.ReleaseShutdownLock()
         
         // Check if shutdown was initiated
@@ -188,13 +191,14 @@ func main() {
     // Sleep then signal for shutdown
     time.Sleep(10 * time.Second)
     em.Shutdown()
+    log.Println("Shutdown has occurred on main routine")
 
     // Wait for manager to exit process 
     select {}
 }
 
 func backgroundTask(ctx context.Context) {
-    ticker := time.NewTicker(1 * time.Second)
+    ticker := time.NewTicker(3 * time.Second)
     defer ticker.Stop()
     for {
         select {

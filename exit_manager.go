@@ -49,7 +49,7 @@ import (
 // ExitManager manages graceful shutdowns for the application.
 //
 // The exit manager will:
-//   - Listen for SIGINT/SIGTERM or Shutdown() signals
+//   - Listen for SIGINT/SIGTERM or [ExitManager.Shutdown] signals
 //   - Prevents shutdown during critical operations via locks
 //   - Executes cleanup functions in reverse registration order
 //   - Supports timeout-based forced exits
@@ -94,7 +94,6 @@ type exitHandler interface {
 	Done() <-chan struct{}
 }
 
-// osExitHandler implements the exitHandler with "os" handling.
 type osExitHandler struct{}
 
 func (ehi osExitHandler) Exit(code int) {
@@ -106,8 +105,8 @@ func (ehi osExitHandler) Done() <-chan struct{} {
 
 // Global returns the global ExitManager instance.
 //
-// The first call to Global creates a singleton exit manager and starts listening for
-// SIGINT and SIGTERM signals. The exit manager to be safely accessed from anywhere in
+// The first call to Global registers the exit manager and starts listening for
+// SIGINT and SIGTERM signals. The exit manager can be safely accessed from anywhere in
 // the application.
 //
 // Example:
@@ -162,8 +161,8 @@ func (em *ExitManager) Locks() int {
 //
 // This method should be called before starting any critical operation that must complete
 // before the process can safely exit. Each successful call must be paired with exactly one
-// call to [ReleaseShutdownLock]. Multiple locks can be retrived by the method where the
-// exit manager will wait until all locks are released before exiting.
+// call to [ExitManager.ReleaseShutdownLock]. Multiple locks can be retrived by the method
+// where the exit manager will wait until all locks are released before exiting.
 //
 // Example #1
 //
@@ -201,7 +200,7 @@ func (em *ExitManager) AcquireShutdownLock() error {
 
 // ReleaseShutdownLock decrements the shutdown lock counter.
 //
-// This must be called exactly once for each successful call to [AcquireShutdownLock].
+// This must be called exactly once for each successful call to [ExitManager.AcquireShutdownLock].
 // If this was the last lock and shutdown has been initiated, the shutdown process
 // will proceed to execute cleanup functions.
 //
@@ -233,7 +232,7 @@ func (em *ExitManager) ReleaseShutdownLock() {
 // Notify returns a receive-only channel that closes when shutdown is initiated.
 //
 // The channel is closed exactly once when the first shutdown signal is received,
-// either by SIGINT/SIGTERM or via Shutdown(). This allows different parts of the
+// either by SIGINT/SIGTERM or via [ExitManager.Shutdown]. This allows different parts of the
 // application to detect and respond to shutdown events.
 //
 // The channel remains closed for the lifetime of the exit manager, so multiple
@@ -255,7 +254,7 @@ func (em *ExitManager) Notify() <-chan struct{} {
 // The method can be called multiple times safely where subsequent calls have no effect.
 //
 // On shutdown, the exit manager will:
-//  1. Close the notification channel returned by Notify()
+//  1. Close the notification channel returned by [ExitManager.Notify]
 //  2. Wait for all shutdown locks to be released
 //  3. Execute cleanup functions in reverse registration order
 //  4. Exit the process
@@ -299,7 +298,7 @@ func (em *ExitManager) RegisterCleanup(f func()) {
 // WithCancel returns a context that is automatically cancelled when shutdown begins.
 //
 // This provides integration with Go's context cancellation patterns. The returned
-// cancel function should still be called to free resources, similar to context.WithCancel.
+// cancel function should still be called to free resources, similar to [context.WithCancel].
 //
 // If shutdown has already been initiated, the returned context will already be cancelled.
 //
