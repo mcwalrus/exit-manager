@@ -38,7 +38,6 @@ package exitmanager
 import (
 	"context"
 	"errors"
-	"net/http"
 	"os"
 	"os/signal"
 	"slices"
@@ -59,17 +58,18 @@ import (
 // return the number of locks held, and cancel any registered contexts on
 // shutdown.
 type ExitManager struct {
-	mu       *sync.RWMutex
-	locks    int
-	notified bool
-	once     *sync.Once
-	timeout  time.Duration
-	locksCh  chan struct{}
-	notifyCh chan struct{}
-	shutdown chan struct{}
-	serverWg *sync.WaitGroup
-	cleanups []func()
-	exit     exitHandler
+	mu            *sync.RWMutex
+	locks         int
+	notified      bool
+	once          *sync.Once
+	timeout       time.Duration
+	locksCh       chan struct{}
+	notifyCh      chan struct{}
+	shutdown      chan struct{}
+	preShutdowns  []func()
+	httpShutdowns []func(*sync.WaitGroup)
+	cleanups      []func()
+	exit          exitHandler
 }
 
 var (
@@ -85,7 +85,6 @@ func newExitManager() *ExitManager {
 		locksCh:  make(chan struct{}),
 		notifyCh: make(chan struct{}),
 		shutdown: make(chan struct{}),
-		serverWg: &sync.WaitGroup{},
 		exit:     osExitHandler{},
 	}
 }
@@ -127,6 +126,8 @@ func Global() *ExitManager {
 // SetTimeout configures the maximum time to wait during shutdown before forcefully exiting.
 //
 // The timeout applies to the entire shutdown process, including:
+//   - Waiting for all registered pre-shutdown hooks to return
+//   - Waiting for all registered http.Server's to shutdown
 //   - Waiting for all shutdown locks to be released
 //   - Executing all registered cleanup functions
 //
@@ -249,55 +250,6 @@ func (em *ExitManager) Notify() <-chan struct{} {
 	return em.notifyCh
 }
 
-// RegisterHTTPServerOnShutdown registers a http.Server to Shutdown on notified event.
-// The exit manager will wait until all servers have shutdown successfully before shutting down.
-// If the error return by the call to server.Shutdown is other than http.ErrServerClosed, handleErr should take appropriate action.
-// If the exit manager is already notified, the server will be shutdown immediately. Timeout can be ignored if 0 or less.
-func (em *ExitManager) RegisterHTTPServerOnShutdown(server *http.Server, timeout time.Duration, handleErr func(err error)) {
-	if handleErr == nil {
-		handleErr = func(err error) {}
-	}
-
-	// consider when exit manager is already notified
-	em.mu.RLock()
-	if em.notified {
-		em.mu.RUnlock()
-
-		ctx := context.Background()
-		if timeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(context.Background(), timeout)
-			defer cancel()
-		}
-
-		err := server.Shutdown(ctx)
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			handleErr(err)
-		}
-		return
-	}
-	em.mu.RUnlock()
-
-	// configure graceful exit for server for when notified
-	em.serverWg.Add(1)
-	go func() {
-		<-em.Notify()
-
-		ctx := context.Background()
-		if timeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(context.Background(), timeout)
-			defer cancel()
-		}
-
-		err := server.Shutdown(ctx)
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			handleErr(err)
-		}
-		em.serverWg.Done()
-	}()
-}
-
 // Shutdown programmatically initiates the shutdown process.
 // This has the same effect as receiving a SIGINT or SIGTERM signal.
 // The method can be called multiple times safely where subsequent calls have no effect.
@@ -345,8 +297,8 @@ func (em *ExitManager) Shutdown() {
 //	})
 func (em *ExitManager) RegisterCleanup(f func()) {
 	em.mu.Lock()
-	defer em.mu.Unlock()
 	em.cleanups = append(em.cleanups, f)
+	em.mu.Unlock()
 }
 
 // WithCancel returns a context that is automatically cancelled when shutdown begins.
@@ -411,20 +363,36 @@ func (em *ExitManager) listenForSignals() {
 	em.once.Do(func() {
 		em.mu.Lock()
 		em.notified = true
+		httpShutdowns := append([]func(*sync.WaitGroup){}, em.httpShutdowns...)
+		cleanups := append([]func(){}, em.cleanups...)
 		close(em.notifyCh)
 		em.mu.Unlock()
 
 		done := make(chan struct{})
 		go func() {
-			for em.locks > 0 {
+
+			// shutdown http.Server's
+			if len(httpShutdowns) > 0 {
+				wg := &sync.WaitGroup{}
+				wg.Add(len(httpShutdowns))
+				for _, f := range httpShutdowns {
+					f(wg)
+				}
+				wg.Wait()
+			}
+
+			// wait for operational locks
+			if em.locks > 0 {
 				<-em.locksCh
 			}
-			em.serverWg.Wait()
-			cleanups := append([]func(){}, em.cleanups...)
+
+			// perform cleanups
 			slices.Reverse(cleanups)
 			for _, f := range cleanups {
 				f()
 			}
+
+			// signal complete
 			close(done)
 		}()
 

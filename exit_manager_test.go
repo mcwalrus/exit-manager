@@ -2,8 +2,8 @@ package exitmanager
 
 import (
 	"context"
-	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -35,17 +35,16 @@ func (em *ExitManager) hijackExitHandler() {
 	}
 }
 
-// exitRecorder records the exit manager on leaving.
+// exitRecorder implements the exitHandler interface.
 type exitRecorder struct {
 	mu          *sync.Mutex
 	code        int
 	nExits      int
-	notified    bool
 	hasExited   bool
+	waited      bool
 	hasExitedCh chan (struct{})
 }
 
-// Exit implements the exitHandler interface.
 func (er *exitRecorder) Exit(code int) {
 	er.mu.Lock()
 	er.nExits++
@@ -55,12 +54,22 @@ func (er *exitRecorder) Exit(code int) {
 	er.mu.Unlock()
 }
 
-// Wait blocks until the exit handler has returned.
 func (er *exitRecorder) Wait() {
 	<-er.hasExitedCh
 	er.mu.Lock()
-	er.notified = true
+	er.waited = true
 	er.mu.Unlock()
+}
+
+// faultyListener implements net.Listener with forced failure
+type faultyListener struct {
+	net.Listener
+	errOnClose error
+}
+
+func (fl *faultyListener) Close() error {
+	_ = fl.Listener.Close()
+	return fl.errOnClose
 }
 
 // checkManagerExitCode tests for the expected exit code from a hijacked exit manager.
@@ -71,8 +80,6 @@ func checkManagerExitCode(t *testing.T, em *ExitManager, code int) {
 	if !ok {
 		t.Fatalf("required em.hijackExitHandler() for test")
 	}
-	er.mu.Lock()
-	defer er.mu.Unlock()
 
 	if !er.hasExited {
 		t.Errorf("exit manager has not been recorded to exit yet...")
@@ -237,249 +244,4 @@ func makeRequest(t *testing.T, url string, expectStatus int) {
 		t.Errorf("unexpected status: got %d, want %d", resp.StatusCode, expectStatus)
 	}
 	_, _ = io.ReadAll(resp.Body)
-}
-
-func TestRegisterHTTPServerOnShutdown(t *testing.T) {
-	t.Parallel()
-
-	t.Run("shutdown http server", func(t *testing.T) {
-		em := testExitManager(t)
-
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ok"))
-		})
-		server := httptest.NewUnstartedServer(handler)
-		server.Start()
-		t.Cleanup(func() { server.Close() })
-
-		httpServer := server.Config
-		httpServer.Addr = server.Listener.Addr().String()
-		httpServer.Handler = handler
-		httpServer.BaseContext = server.Config.BaseContext
-
-		handlerErrCalled := false
-		em.RegisterHTTPServerOnShutdown(server.Config, 0, func(err error) {
-			handlerErrCalled = true
-		})
-
-		if !isServerAlive(server) {
-			t.Fatal("server should be alive before shutdown")
-		}
-
-		em.Shutdown()
-		er := (em.exit).(*exitRecorder)
-		er.Wait()
-
-		if isServerAlive(server) {
-			t.Error("server should not be alive after shutdown")
-		}
-		if handlerErrCalled {
-			t.Error("http server shutdown should not call handleErr")
-		}
-
-		checkManagerExitCode(t, em, 0)
-	})
-
-	t.Run("shutdown http server with on-going connections", func(t *testing.T) {
-		em := testExitManager(t)
-
-		blockCh := make(chan struct{})
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.(http.Flusher).Flush()
-			<-blockCh // block until shutdown
-		})
-
-		server := httptest.NewUnstartedServer(handler)
-		server.Start()
-		t.Cleanup(func() { server.Close() })
-
-		httpServer := server.Config
-		httpServer.Addr = server.Listener.Addr().String()
-		httpServer.Handler = handler
-		httpServer.BaseContext = server.Config.BaseContext
-		em.RegisterHTTPServerOnShutdown(server.Config, 0, nil)
-
-		done := make(chan struct{})
-		go func() {
-			makeRequest(t, server.URL, http.StatusOK)
-			close(done)
-		}()
-
-		// ensure request is in-flight, allow handler to finish
-		time.Sleep(20 * time.Millisecond)
-		em.Shutdown()
-		close(blockCh)
-		<-done
-
-		if isServerAlive(server) {
-			t.Error("server should not be alive after shutdown")
-		}
-
-		checkManagerExitCode(t, em, 0)
-	})
-
-	t.Run("shutdown multiple http servers", func(t *testing.T) {
-		em := testExitManager(t)
-		servers := []*httptest.Server{}
-
-		// register test servers
-		for i := 0; i < 2; i++ {
-			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte("ok"))
-			})
-
-			server := httptest.NewUnstartedServer(handler)
-			server.Start()
-			t.Cleanup(func() { server.Close() })
-
-			httpServer := server.Config
-			httpServer.Addr = server.Listener.Addr().String()
-			httpServer.Handler = handler
-			httpServer.BaseContext = server.Config.BaseContext
-
-			em.RegisterHTTPServerOnShutdown(server.Config, 0, nil)
-			servers = append(servers, server)
-		}
-
-		// check availabity
-		for _, server := range servers {
-			if !isServerAlive(server) {
-				t.Fatal("server should be alive before shutdown")
-			}
-		}
-
-		em.Shutdown()
-		er := (em.exit).(*exitRecorder)
-		er.Wait()
-
-		for _, server := range servers {
-			if isServerAlive(server) {
-				t.Error("server should not be alive after shutdown")
-			}
-		}
-
-		checkManagerExitCode(t, em, 0)
-	})
-
-	t.Run("shutdown http server error handling", func(t *testing.T) {
-		em := testExitManager(t)
-
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ok"))
-		})
-		server := httptest.NewUnstartedServer(handler)
-		server.Start()
-		t.Cleanup(func() { server.Close() })
-
-		httpServer := server.Config
-		httpServer.Addr = server.Listener.Addr().String()
-		httpServer.Handler = handler
-		httpServer.BaseContext = server.Config.BaseContext
-
-		handlerErrCalled := false
-		em.RegisterHTTPServerOnShutdown(server.Config, 0, func(err error) {
-			handlerErrCalled = true
-		})
-
-		// Close the server listener to force an error on shutdown
-		server.Listener.Close()
-
-		em.Shutdown()
-		er := (em.exit).(*exitRecorder)
-		er.Wait()
-
-		if !handlerErrCalled {
-			t.Error("error handler should be called if shutdown returns error") // TODO: Race condition!
-		}
-
-		checkManagerExitCode(t, em, 0)
-	})
-
-	t.Run("shutdown http server with notified exit manager", func(t *testing.T) {
-		em := testExitManager(t)
-		em.Shutdown()
-
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ok"))
-		})
-		server := httptest.NewUnstartedServer(handler)
-		server.Start()
-		t.Cleanup(func() { server.Close() })
-
-		httpServer := server.Config
-		httpServer.Addr = server.Listener.Addr().String()
-		httpServer.Handler = handler
-		httpServer.BaseContext = server.Config.BaseContext
-
-		// check immediately without wait, expect eager shutdown
-		handlerErrCalled := false
-		em.RegisterHTTPServerOnShutdown(server.Config, 0, func(err error) {
-			handlerErrCalled = true
-		})
-		if isServerAlive(server) {
-			t.Error("server should not be alive after shutdown")
-		}
-		if handlerErrCalled {
-			t.Error("error handler should be called if shutdown returns error")
-		}
-
-		checkManagerExitCode(t, em, 0)
-	})
-
-	t.Run("check timeout works catching context.DeadlineExceeded on shutdown", func(t *testing.T) {
-		em := testExitManager(t)
-
-		// Block until test releases
-		blockCh := make(chan struct{})
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.(http.Flusher).Flush()
-			<-blockCh
-		})
-
-		server := httptest.NewUnstartedServer(handler)
-		server.Start()
-		t.Cleanup(func() { server.Close() })
-
-		httpServer := server.Config
-		httpServer.Addr = server.Listener.Addr().String()
-		httpServer.Handler = handler
-		httpServer.BaseContext = server.Config.BaseContext
-
-		// Register http.Server with short shutdown timeout
-		errCh := make(chan error, 1)
-		em.RegisterHTTPServerOnShutdown(server.Config, 10*time.Millisecond, func(err error) {
-			errCh <- err
-		})
-
-		// Start a request that will block, wait for handler start and block
-		done := make(chan struct{})
-		go func() {
-			makeRequest(t, server.URL, http.StatusOK)
-			close(done)
-		}()
-		time.Sleep(20 * time.Millisecond)
-		em.Shutdown()
-
-		// Catch context.DeadlineExceeded within registered shutdown timeout
-		select {
-		case err := <-errCh:
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Error("expected deadline error due to shutdown timeout")
-			}
-		case <-time.After(200 * time.Millisecond):
-			t.Error("timeout occurred waiting for handleErr to be called")
-		}
-
-		// Unblock the handler to let the go-routine finish
-		close(blockCh)
-		<-done
-
-		checkManagerExitCode(t, em, 0)
-	})
 }
