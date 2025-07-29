@@ -208,6 +208,14 @@ func backgroundTask(ctx context.Context) {
 }
 ```
 
+## Test
+
+To test the library, please use the race condition checker:
+
+```
+$ go test -race .
+```
+
 ## Contributing
 
 Please report any issues or feature requests to the [GitHub repository](https://github.com/mcwalrus/exitmanager).

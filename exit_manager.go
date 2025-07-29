@@ -91,6 +91,7 @@ func newExitManager() *ExitManager {
 // This interface type can be replace or hijacked for testing.
 type exitHandler interface {
 	Exit(code int)
+	Done() <-chan struct{}
 }
 
 // osExitHandler implements the exitHandler with "os" handling.
@@ -98,6 +99,9 @@ type osExitHandler struct{}
 
 func (ehi osExitHandler) Exit(code int) {
 	os.Exit(code)
+}
+func (ehi osExitHandler) Done() <-chan struct{} {
+	return nil
 }
 
 // Global returns the global ExitManager instance.
@@ -147,8 +151,8 @@ func (em *ExitManager) SetTimeout(timeout time.Duration) {
 //	    log.Printf("Waiting for %d operations to complete", em.Locks())
 //	}
 func (em *ExitManager) Locks() int {
-	em.mu.Lock()
-	defer em.mu.Unlock()
+	em.mu.RLock()
+	defer em.mu.RUnlock()
 	return em.locks
 }
 
@@ -262,6 +266,7 @@ func (em *ExitManager) Shutdown() {
 	select {
 	case <-em.shutdown:
 	default:
+		em.notified = true
 		close(em.shutdown)
 	}
 	em.mu.Unlock()
@@ -311,7 +316,6 @@ func (em *ExitManager) RegisterCleanup(f func()) {
 //	}
 func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
 
 	em.mu.RLock()
 	if em.notified {
@@ -321,6 +325,7 @@ func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context
 	}
 	em.mu.RUnlock()
 
+	done := make(chan struct{})
 	once := sync.Once{}
 	cleanup := func() {
 		once.Do(func() {
@@ -355,13 +360,15 @@ func (em *ExitManager) listenForSignals() {
 		em.notified = true
 		cleanups := append([]func(){}, em.cleanups...)
 		close(em.notifyCh)
+		locks := em.locks
 		em.mu.Unlock()
 
 		done := make(chan struct{})
 		go func() {
-			if em.locks > 0 {
+			if locks > 0 {
 				<-em.locksCh
 			}
+
 			slices.Reverse(cleanups)
 			for _, f := range cleanups {
 				f()
