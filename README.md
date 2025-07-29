@@ -173,7 +173,7 @@ func criticalWorker(em *exitmanager.ExitManager, id int) {
 
 ### Cleanup Functions
 
-Use when you need to clean up resources (close files, database connections, etc.) in a specific order. Registered cleanup functions run in reverse order.
+Use when you need to clean up resources (close files, database connections, etc.) in a specific order. Registered cleanup functions with the exit manager run in reverse order.
 
 ```go
 package main
@@ -204,17 +204,16 @@ func main() {
 
     // Register cleanup functions
     em.RegisterCleanup(func() {
-        log.Println("Step 1: Closing database connections")
+        log.Println("Closing database connections")
         database.Close()
     })
 
     em.RegisterCleanup(func() {
-        log.Println("Step 2: Flushing cache") 
+        log.Println("Close cache connections") 
         cache.Close()
     })
 
     em.RegisterCleanup(func() {
-        log.Println("Step 3: Final cleanup")
         log.Println("All resources cleaned up!")
     })
 
@@ -225,14 +224,14 @@ func main() {
     <-em.Notify()
     log.Println("Shutdown started...")
     
-    // Exit manager will run cleanup functions and exit
+    // Exit manager will run cleanup functions before exiting
     select {}
 }
 ```
 
 ### Context Integration
 
-Use when you have long-running operations that should be cancelled on shutdown. When shutdown starts, registered contexts are automatically cancelled, cleanly stopping the long-running operation.
+Use when you have long-running operations that should be cancelled on shutdown. When shutdown starts, registered contexts with the exit manager are cancelled, cleanly stopping the long-running operation.
 
 ```go
 package main
@@ -248,9 +247,14 @@ import (
 func main() {
     em := exitmanager.Global()
 
-    // Create a context that cancels automatically on shutdown
+    // Register a context that is cancelled on shutdown
     ctx, cancel := em.WithCancel(context.Background())
     defer cancel()
+
+    // Waits for long-running task
+    em.RegisterCleanup(func() {
+        time.Sleep(100 * time.Millisecond)
+    })
 
     // Start long-running operation
     go longRunningTask(ctx)
@@ -297,10 +301,10 @@ func main() {
     em := exitmanager.Global()
     em.SetTimeout(10 * time.Second)
     
+    // Waits for background worker on exit
     em.RegisterCleanup(func() {
-        log.Println("Cleaning up resources...")
+        time.Sleep(100 * time.Millisecond)
     })
-    // Bckground worker uses global exit manager
     go backgroundWorker()
 
     log.Println("Services started. Press Ctrl+C to shutdown...")
@@ -310,6 +314,7 @@ func main() {
     select {}
 }
 
+// backgroundWorker uses global exit manager
 func backgroundWorker() {
     em := exitmanager.Global()
     ticker := time.NewTicker(2 * time.Second)
@@ -330,6 +335,10 @@ func backgroundWorker() {
 ## Contributing
 
 Report issues and feature requests at the [GitHub repository](https://github.com/mcwalrus/exitmanager).
+
+In future I would look to provide a seperate sub-module for registering http.Server's.
+
+I am open to ideas of other integrations this library can provide.
 
 ## License
 
