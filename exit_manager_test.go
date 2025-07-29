@@ -7,9 +7,10 @@ import (
 	"time"
 )
 
-// newTestExitManager returns a hijacked test ExitManager.
-// This avoids the case where the ExitManager will call os.Exit(code) during tests.
-// You can also record the exit manager exit code with the registed exitHandlerRecorder set.
+// testExitManager returns an ExitManager instance for use in tests.
+// This version is "hijacked" so it won't actually call os.Exit, and instead
+// lets you inspect the exit code via a test exit handler. It also ensures
+// cleanup after the test is done.
 func testExitManager(t *testing.T) *ExitManager {
 	t.Helper()
 
@@ -27,7 +28,6 @@ func testExitManager(t *testing.T) *ExitManager {
 	return em
 }
 
-// hijackExitHandler sets the exit handler to a test exit handler.
 func (em *ExitManager) hijackExitHandler() {
 	em.exit = &exitRecorder{
 		mu:          &sync.Mutex{},
@@ -35,7 +35,10 @@ func (em *ExitManager) hijackExitHandler() {
 	}
 }
 
-// exitRecorder implements the exitHandler interface.
+// exitRecorder is a test helper which implements the exitHandler interface.
+// It records exit attempts (code and count) instead of terminating the process,
+// allowing tests to verify exit behaviour. The exitRecorder can be used to notify
+// the test that the exit manager has exited with Done().
 type exitRecorder struct {
 	mu          *sync.Mutex
 	code        int
@@ -45,17 +48,17 @@ type exitRecorder struct {
 
 func (er *exitRecorder) Exit(code int) {
 	er.mu.Lock()
-	defer er.mu.Unlock()
 	er.nExits++
 	er.code = code
 	close(er.hasExitedCh)
+	er.mu.Unlock()
 }
 
 func (er *exitRecorder) Done() <-chan struct{} {
 	return er.hasExitedCh
 }
 
-// checkManagerExitCode tests for the expected exit code from a hijacked exit manager.
+// checkManagerExitCode verifies the exit manager has exited with the expected code.
 func checkManagerExitCode(t *testing.T, em *ExitManager, code int) {
 	t.Helper()
 
