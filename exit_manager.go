@@ -58,18 +58,16 @@ import (
 // return the number of locks held, and cancel any registered contexts on
 // shutdown.
 type ExitManager struct {
-	mu            *sync.RWMutex
-	locks         int
-	notified      bool
-	once          *sync.Once
-	timeout       time.Duration
-	locksCh       chan struct{}
-	notifyCh      chan struct{}
-	shutdown      chan struct{}
-	preShutdowns  []func()
-	httpShutdowns []func(*sync.WaitGroup)
-	cleanups      []func()
-	exit          exitHandler
+	mu       *sync.RWMutex
+	locks    int
+	notified bool
+	once     *sync.Once
+	timeout  time.Duration
+	locksCh  chan struct{}
+	notifyCh chan struct{}
+	shutdown chan struct{}
+	cleanups []func()
+	exit     exitHandler
 }
 
 var (
@@ -126,8 +124,6 @@ func Global() *ExitManager {
 // SetTimeout configures the maximum time to wait during shutdown before forcefully exiting.
 //
 // The timeout applies to the entire shutdown process, including:
-//   - Waiting for all registered pre-shutdown hooks to return
-//   - Waiting for all registered http.Server's to shutdown
 //   - Waiting for all shutdown locks to be released
 //   - Executing all registered cleanup functions
 //
@@ -162,7 +158,7 @@ func (em *ExitManager) Locks() int {
 //
 // This method should be called before starting any critical operation that must complete
 // before the process can safely exit. Each successful call must be paired with exactly one
-// call to ReleaseShutdownLock(). Multiple locks can be retrived by the method where the
+// call to [ReleaseShutdownLock]. Multiple locks can be retrived by the method where the
 // exit manager will wait until all locks are released before exiting.
 //
 // Example #1
@@ -201,7 +197,7 @@ func (em *ExitManager) AcquireShutdownLock() error {
 
 // ReleaseShutdownLock decrements the shutdown lock counter.
 //
-// This must be called exactly once for each successful call to AcquireShutdownLock().
+// This must be called exactly once for each successful call to [AcquireShutdownLock].
 // If this was the last lock and shutdown has been initiated, the shutdown process
 // will proceed to execute cleanup functions.
 //
@@ -244,7 +240,7 @@ func (em *ExitManager) ReleaseShutdownLock() {
 //	go func() {
 //	    <-em.Notify()
 //	    log.Println("Shutdown signal received, stopping background work")
-//	    // ... cleanup logic
+//	    // gracefully exit go-routine ...
 //	}()
 func (em *ExitManager) Notify() <-chan struct{} {
 	return em.notifyCh
@@ -260,8 +256,7 @@ func (em *ExitManager) Notify() <-chan struct{} {
 //  3. Execute cleanup functions in reverse registration order
 //  4. Exit the process
 //
-// Note the Shutdown method is non-blocking so you will have to wait if called on the main
-// routine.
+// Note Shutdown is non-blocking so you will have to wait if called on the main routine.
 func (em *ExitManager) Shutdown() {
 	em.mu.Lock()
 	select {
@@ -285,15 +280,10 @@ func (em *ExitManager) Shutdown() {
 //
 // Example:
 //
-//	// Register cleanup functions
+//	var db = &sql.DB{}
 //	em.RegisterCleanup(func() {
 //	    log.Println("Closing database connections...")
 //	    db.Close()
-//	})
-//
-//	em.RegisterCleanup(func() {
-//	    log.Println("Stopping HTTP server...")
-//	    server.Shutdown(ctx)
 //	})
 func (em *ExitManager) RegisterCleanup(f func()) {
 	em.mu.Lock()
@@ -363,36 +353,19 @@ func (em *ExitManager) listenForSignals() {
 	em.once.Do(func() {
 		em.mu.Lock()
 		em.notified = true
-		httpShutdowns := append([]func(*sync.WaitGroup){}, em.httpShutdowns...)
 		cleanups := append([]func(){}, em.cleanups...)
 		close(em.notifyCh)
 		em.mu.Unlock()
 
 		done := make(chan struct{})
 		go func() {
-
-			// shutdown http.Server's
-			if len(httpShutdowns) > 0 {
-				wg := &sync.WaitGroup{}
-				wg.Add(len(httpShutdowns))
-				for _, f := range httpShutdowns {
-					f(wg)
-				}
-				wg.Wait()
-			}
-
-			// wait for operational locks
 			if em.locks > 0 {
 				<-em.locksCh
 			}
-
-			// perform cleanups
 			slices.Reverse(cleanups)
 			for _, f := range cleanups {
 				f()
 			}
-
-			// signal complete
 			close(done)
 		}()
 

@@ -9,7 +9,6 @@
 - 🎯 **Context Integration**: Register cancellation contexts on notified shutdown
 - 🧹 **Cleanup Coordination**: Executes cleanup functions in reverse registration order
 - 📡 **Shutdown Notifications**: Notify goroutines when notified shutdown begins
-- **Server Registrations**: Handles graceful server shutdown before coordinated cleanup
 - ⏱️ **Timeout Support**: Configurable forced exit after timeout
 
 ## Installation
@@ -26,11 +25,15 @@ Use exit-manager when you have multiple goroutines performing critical work that
 
 **2) Resource Cleanup**
 
-Use exit-manager when you need to guarantee cleanup functions execute in a specific order during shutdown (database connections, file handles, network connections, etc).
+Use exit-manager when you need to guarantee or manage cleanup functions execute in a specific order during shutdown (database connections, file handles, network connections, etc).
 
-**3) Graceful Server Shutdowns**
+## Best Practices
 
-Use exit-manager for web servers, micro-services, or any long-running application that needs to handle shutdown signals gracefully while completing in-flight requests.
+1. **Always pair locks**: Every `AcquireShutdownLock()` must have a corresponding `ReleaseShutdownLock()`
+2. **Use defer**: Always use `defer em.ReleaseShutdownLock()` immediately after acquiring a lock
+3. **Check lock acquisition**: Always check the error from `AcquireShutdownLock()`
+5. **Set timeouts**: Use `SetTimeout()` to avoid hanging during process shutdown
+4. **Quick cleanup**: Keep cleanup functions fast and non-blocking
 
 ## Quick Start
 
@@ -57,19 +60,73 @@ func main() {
         log.Println("Stopping background workers...")
     })
 
+    // Set a timeout for forced shutdown
+    em.SetTimeout(30 * time.Second)
+
+    // Shutdown process after sleep
+    go func () {
+        time.Sleep(10 * time.Second)
+        em.Shutdown()
+    }()
+
+    for {
+        // Protect critical operation
+        if err := em.AcquireShutdownLock(); err == nil {
+            log.Printf("Worker: shutdown in progress, exiting", id)
+            
+        }
+        // Simulate work release lock
+        log.Printf("Worker: processing...", id)
+        time.Sleep(2 * time.Second)
+        em.ReleaseShutdownLock()
+        
+        // Check for notified shutdown
+        select {
+        case <-em.Notify():
+            log.Printf("Worker: received shutdown signal", id)
+            break
+        default:
+            // Continue working
+        }
+    }
+    
+    // Wait forever, exit-manager to exit process
+    select {}
+}
+```
+
+### Acquiring Shutdown Locks
+
+You can acquire multiple shutdown locks at once for critical operations.
+
+```go
+package main
+
+import (
+    "log"
+    "time"
+    "github.com/mcwalrus/exit-manager"
+)
+
+func main() {
+    em := exitmanager.Global()
+
+    // Shutdown process after sleep
+    go func () {
+        time.Sleep(10 * time.Second)
+        em.Shutdown()
+    }()
+
     // Start worker goroutines
     for i := 0; i < 3; i++ {
         go doWork(i)
     }
 
-    // Set a timeout for forced shutdown
-    em.SetTimeout(30 * time.Second)
-
     // Wait for shutdown signal
     <-em.Notify()
     log.Println("Shutdown initiated, waiting for workers...")
     
-    // Wait for manager to exit process
+    // Wait forever, exit-manager to exit process
     select {}
 }
 
@@ -83,10 +140,9 @@ func doWork(id int) {
             return
         }
         
-        // Simulate work
+        // Simulate work, release lock
         log.Printf("Worker %d: processing...", id)
-        time.Sleep(2 * time.Second)
-        
+        time.Sleep(2.34 * time.Second)
         em.ReleaseShutdownLock()
         
         // Check if shutdown was initiated
@@ -102,6 +158,8 @@ func doWork(id int) {
 ```
 
 ### Context Integration
+
+You can register contexts with the exit-manager to be cancelled on notified shutdown.
 
 ```go
 package main
@@ -121,16 +179,23 @@ func main() {
     defer cancel()
     
     go backgroundTask(ctx)
-    
-    // Simulate some work
+
+    // Cleanup avoids immediate exit
+    em.RegisterCleanup(func() {
+        time.Sleep(5 * time.Second)
+    })
+
+    // Sleep then signal for shutdown
     time.Sleep(10 * time.Second)
     em.Shutdown()
+
+    // Wait for manager to exit process 
+    select {}
 }
 
 func backgroundTask(ctx context.Context) {
     ticker := time.NewTicker(1 * time.Second)
     defer ticker.Stop()
-    
     for {
         select {
         case <-ctx.Done():
@@ -142,74 +207,6 @@ func backgroundTask(ctx context.Context) {
     }
 }
 ```
-
-### HTTP Server Example
-
-```go
-package main
-
-import (
-    "context"
-    "log"
-    "net/http"
-    "time"
-    "github.com/mcwalrus/exit-manager"
-)
-
-func main() {
-    em := exitmanager.Global()
-    
-    server := &http.Server{
-        Addr:    ":8080",
-        Handler: http.HandlerFunc(handleRequest),
-    }
-    
-    // Register server shutdown
-    em.RegisterCleanup(func() {
-        log.Println("Shutting down HTTP server...")
-        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-        defer cancel()
-        server.Shutdown(ctx)
-    })
-    
-    // Set overall timeout
-    em.SetTimeout(30 * time.Second)
-    
-    go func() {
-        log.Println("Starting server on :8080")
-        server.ListenAndServe()
-    }()
-    
-    // Wait for shutdown
-    <-em.Notify()
-    log.Println("Graceful shutdown initiated...")
-    em.Shutdown()
-}
-
-func handleRequest(w http.ResponseWriter, r *http.Request) {
-    em := exitmanager.Global()
-    
-    // Protect request processing
-    if err := em.AcquireShutdownLock(); err != nil {
-        http.Error(w, "Server shutting down", http.StatusServiceUnavailable)
-        return
-    }
-    defer em.ReleaseShutdownLock()
-    
-    // Simulate request processing
-    time.Sleep(2 * time.Second)
-    w.WriteHeader(http.StatusOK)
-    w.Write([]byte("Request processed"))
-}
-```
-
-## Best Practices
-
-1. **Always pair locks**: Every `AcquireShutdownLock()` must have a corresponding `ReleaseShutdownLock()`
-2. **Use defer**: Always use `defer em.ReleaseShutdownLock()` immediately after acquiring a lock
-3. **Check lock acquisition**: Always check the error from `AcquireShutdownLock()`
-5. **Set timeouts**: Use `SetTimeout()` to avoid hanging during process shutdown
-4. **Quick cleanup**: Keep cleanup functions fast and non-blocking
 
 ## Contributing
 
