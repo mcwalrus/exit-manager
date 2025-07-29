@@ -4,11 +4,11 @@ A Go library that provides **graceful shutdown coordination** for applications, 
 
 ## Features
 
-1. **Signal Handling**: Registers listener for SIGINT (Ctrl+C) and SIGTERM
-2. **Notifications**: When shutdown starts, the `Notify()` channel closes
-3. **Lock Coordination**: Waits for all shutdown locks to be released
-4. **Cleanup Execution**: Runs cleanup functions in reverse registration order  
-5. **Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
+1. **🔄 Signal Handling**: Registers listener for SIGINT (Ctrl+C) and SIGTERM
+2. **📡 Notifications**: When shutdown starts, the `Notify()` channel closes
+3. **🔒 Lock Coordination**: Waits for all shutdown locks to be released
+4. **🧹 Cleanup Execution**: Runs cleanup functions in reverse registration order  
+5. **🚪 Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
 
 ## Installation
 
@@ -273,6 +273,55 @@ func longRunningTask(ctx context.Context) {
             return
         case <-ticker.C:
             log.Println("Long-running task: processing...")
+        }
+    }
+}
+```
+
+## Global Access
+
+An example showing different routines accessing the global exit manager:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "time"
+
+    exitmanager "github.com/mcwalrus/exit-manager"
+)
+
+func main() {
+    em := exitmanager.Global()
+    em.SetTimeout(10 * time.Second)
+    
+    em.RegisterCleanup(func() {
+        log.Println("Cleaning up resources...")
+    })
+    // Bckground worker uses global exit manager
+    go backgroundWorker()
+
+    log.Println("Services started. Press Ctrl+C to shutdown...")
+    <-em.Notify()
+    
+    log.Println("Shutdown initiated")
+    select {}
+}
+
+func backgroundWorker() {
+    em := exitmanager.Global()
+    ticker := time.NewTicker(2 * time.Second)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-em.Notify():
+            log.Println("Worker: shutdown signal received, stopping")
+            return
+        case <-ticker.C:
+            log.Println("Background work...")
         }
     }
 }
