@@ -1,37 +1,47 @@
 // Package exitmanager provides graceful shutdown coordination for Go applications.
 //
+// ExitManager coordinates graceful shutdowns by:
+//   - Listening for SIGINT/SIGTERM signals or programmatic shutdown requests
+//   - Preventing shutdown during critical operations via shutdown locks
+//   - Executing cleanup functions in reverse registration order
+//   - Supporting configurable shutdown timeouts
+//
 // Basic usage:
 //
 //	func main() {
 //		em := exitmanager.Global()
 //
-//		// Register cleanup
+//		// Register cleanup functions
 //		em.RegisterCleanup(func() {
-//		    log.Println("Cleaning up...")
+//			log.Println("Cleaning up...")
 //		})
 //
-//		// Handles multiple go-routinues
+//		// Start workers
 //		for i := 0; i < 3; i++ {
-//			go doWork(i)
-//	   	}
+//			go doWork(em, i)
+//		}
 //
-//		// Call Shutdown once all go-routines have started
-//		time.Sleep(10 * time.Millisecond)
-//		em.Shutdown()
+//		// Wait for shutdown signal
+//		<-em.Notify()
+//		log.Println("Shutdown initiated, waiting for workers...")
+//
+//		// Optional: programmatic shutdown
+//		// em.Shutdown()
 //	}
 //
-//	func doWork(i int) {
-//		// Protect critical operation
-//		if err := em.AcquireShutdownLock(); err != nil {
-//			return // Handle shutdown in progress
+//	func doWork(em *exitmanager.ExitManager, id int) {
+//		for {
+//			// Protect critical operations
+//			if err := em.AcquireShutdownLock(); err != nil {
+//				log.Printf("Worker %d: shutdown in progress, exiting", id)
+//				return
+//			}
+//			defer em.ReleaseShutdownLock()
+//
+//			// Perform work
+//			time.Sleep(time.Second)
+//			log.Printf("Worker %d completed task", id)
 //		}
-//		defer em.ReleaseShutdownLock()
-//
-//		// Do critical work...
-//		time.Sleep(i * time.Second)
-//		log.Printf("Print i: %d\n", i)
-//
-//		return
 //	}
 package exitmanager
 
@@ -46,17 +56,17 @@ import (
 	"time"
 )
 
-// ExitManager manages graceful shutdowns for the application.
+// ExitManager coordinates graceful application shutdowns.
 //
-// The exit manager will:
-//   - Listen for SIGINT/SIGTERM or [ExitManager.Shutdown] signals
-//   - Prevents shutdown during critical operations via locks
-//   - Executes cleanup functions in reverse registration order
-//   - Supports timeout-based forced exits
+// Key features:
+//   - Signal handling: Automatically listens for SIGINT/SIGTERM
+//   - Shutdown locks: Prevent shutdown during critical operations
+//   - Cleanup functions: Execute registered cleanup in reverse order
+//   - Notifications: Notify goroutines when shutdown begins
+//   - Timeouts: Configurable forced exit after timeout
+//   - Context integration: Cancel contexts on shutdown
 //
-// The exit manager also can notify go-routines of initiated shutdown,
-// return the number of locks held, and cancel any registered contexts on
-// shutdown.
+// Use Global() to get the singleton instance.
 type ExitManager struct {
 	mu       *sync.RWMutex
 	locks    int
@@ -87,8 +97,8 @@ func newExitManager() *ExitManager {
 	}
 }
 
-// exitHandler provides the interface to exit the application.
-// This interface type can be replace or hijacked for testing.
+// exitHandler provides an interface for process termination.
+// Allows replacement with test implementations for testing.
 type exitHandler interface {
 	Exit(code int)
 	Done() <-chan struct{}
@@ -103,17 +113,16 @@ func (ehi osExitHandler) Done() <-chan struct{} {
 	return nil
 }
 
-// Global returns the global ExitManager instance.
+// Global returns the singleton ExitManager instance.
 //
-// The first call to Global registers the exit manager and starts listening for
-// SIGINT and SIGTERM signals. The exit manager can be safely accessed from anywhere in
-// the application.
+// The first call registers signal handlers for SIGINT and SIGTERM.
+// Subsequent calls return the same instance. Safe for concurrent access.
 //
 // Example:
 //
 //	em := exitmanager.Global()
 //	em.RegisterCleanup(func() {
-//	    log.Println("Shutting down...")
+//		log.Println("Shutting down...")
 //	})
 func Global() *ExitManager {
 	once.Do(func() {
@@ -124,14 +133,14 @@ func Global() *ExitManager {
 	return manager
 }
 
-// SetTimeout configures the maximum time to wait during shutdown before forcefully exiting.
+// SetTimeout configures the maximum shutdown duration before forced exit.
 //
-// The timeout applies to the entire shutdown process, including:
-//   - Waiting for all shutdown locks to be released
-//   - Executing all registered cleanup functions
+// The timeout covers the entire shutdown process:
+//   - Waiting for shutdown locks to be released
+//   - Executing cleanup functions
 //
-// If timeout is <= 0, the process will wait indefinitely for graceful shutdown.
-// If timeout expires, the process exits with exit code 1, potentially interrupting cleanup.
+// If timeout <= 0, waits indefinitely for graceful shutdown.
+// If timeout expires, exits with code 1 (may interrupt cleanup).
 func (em *ExitManager) SetTimeout(timeout time.Duration) {
 	em.mu.Lock()
 	em.timeout = timeout
@@ -140,14 +149,13 @@ func (em *ExitManager) SetTimeout(timeout time.Duration) {
 
 // Locks returns the current number of active shutdown locks.
 //
-// This can be useful for debugging or monitoring the shutdown state.
-// A non-zero value indicates that critical operations are still in progress
-// and preventing shutdown from completing.
+// Useful for monitoring shutdown progress. A non-zero value indicates
+// critical operations are still preventing shutdown completion.
 //
 // Example:
 //
 //	if em.Locks() > 0 {
-//	    log.Printf("Waiting for %d operations to complete", em.Locks())
+//		log.Printf("Waiting for %d operations to complete", em.Locks())
 //	}
 func (em *ExitManager) Locks() int {
 	em.mu.RLock()
@@ -155,37 +163,21 @@ func (em *ExitManager) Locks() int {
 	return em.locks
 }
 
-// AcquireShutdownLock prevents the shutdown process from proceeding until lock is released.
-// The method returns an error if the shutdown process has already been initiated, in which
-// case the calling function should abort the operation handling gracefully.
+// AcquireShutdownLock prevents shutdown until the lock is released.
 //
-// This method should be called before starting any critical operation that must complete
-// before the process can safely exit. Each successful call must be paired with exactly one
-// call to [ExitManager.ReleaseShutdownLock]. Multiple locks can be retrived by the method
-// where the exit manager will wait until all locks are released before exiting.
+// Returns an error if shutdown has already been initiated, allowing
+// the caller to abort the operation gracefully. Each successful call
+// must be paired with exactly one call to ReleaseShutdownLock().
 //
-// Example #1
+// Multiple locks can be acquired; shutdown waits for all to be released.
+//
+// Example:
 //
 //	if err := em.AcquireShutdownLock(); err != nil {
-//	    return err
+//		return err // Shutdown in progress
 //	}
 //	defer em.ReleaseShutdownLock()
-//
 //	// Perform critical operation...
-//
-// Example #2
-//
-//	func doWork(i int) {
-//		if err := em.AcquireShutdownLock(); err != nil {
-//			return
-//		}
-//		defer em.ReleaseShutdownLock()
-//		// Do critical work...
-//	}
-//
-//	for i := 0; i < 3; i++ {
-//		go doWork(i)
-//	}
 func (em *ExitManager) AcquireShutdownLock() error {
 	em.mu.Lock()
 	if em.notified {
@@ -200,20 +192,11 @@ func (em *ExitManager) AcquireShutdownLock() error {
 
 // ReleaseShutdownLock decrements the shutdown lock counter.
 //
-// This must be called exactly once for each successful call to [ExitManager.AcquireShutdownLock].
-// If this was the last lock and shutdown has been initiated, the shutdown process
-// will proceed to execute cleanup functions.
+// Must be called exactly once for each successful AcquireShutdownLock().
+// If this releases the last lock and shutdown has been initiated,
+// the shutdown process proceeds to execute cleanup functions.
 //
-// It is safe to call this method even if no locks were acquired, though this
-// represents a programming error.
-//
-// Example:
-//
-//	if err := em.AcquireShutdownLock(); err != nil {
-//	    return // Shutdown in process, avoids critical operation
-//	}
-//	defer em.ReleaseShutdownLock()
-//	// ... perform critical operation
+// Safe to call even without acquired locks (programming error).
 func (em *ExitManager) ReleaseShutdownLock() {
 	em.mu.Lock()
 	if em.locks > 0 {
@@ -229,37 +212,33 @@ func (em *ExitManager) ReleaseShutdownLock() {
 	em.mu.Unlock()
 }
 
-// Notify returns a receive-only channel that closes when shutdown is initiated.
+// Notify returns a channel that closes when shutdown is initiated.
 //
-// The channel is closed exactly once when the first shutdown signal is received,
-// either by SIGINT/SIGTERM or via [ExitManager.Shutdown]. This allows different parts of the
-// application to detect and respond to shutdown events.
-//
-// The channel remains closed for the lifetime of the exit manager, so multiple
-// readers can safely select on it.
+// The channel closes exactly once on the first shutdown signal
+// (SIGINT/SIGTERM or Shutdown()). Remains closed thereafter,
+// so multiple readers can safely select on it.
 //
 // Example:
 //
 //	go func() {
-//	    <-em.Notify()
-//	    log.Println("Shutdown signal received, stopping background work")
-//	    // gracefully exit go-routine ...
+//		<-em.Notify()
+//		log.Println("Shutdown initiated, stopping background work")
+//		// Exit goroutine gracefully
 //	}()
 func (em *ExitManager) Notify() <-chan struct{} {
 	return em.notifyCh
 }
 
 // Shutdown programmatically initiates the shutdown process.
-// This has the same effect as receiving a SIGINT or SIGTERM signal.
-// The method can be called multiple times safely where subsequent calls have no effect.
 //
-// On shutdown, the exit manager will:
-//  1. Close the notification channel returned by [ExitManager.Notify]
+// Has the same effect as receiving SIGINT/SIGTERM. Safe to call multiple times.
+// This method is non-blocking.
+//
+// Shutdown process:
+//  1. Close the notification channel (Notify())
 //  2. Wait for all shutdown locks to be released
 //  3. Execute cleanup functions in reverse registration order
 //  4. Exit the process
-//
-// Note Shutdown is non-blocking so you will have to wait if called on the main routine.
 func (em *ExitManager) Shutdown() {
 	em.mu.Lock()
 	select {
@@ -271,23 +250,20 @@ func (em *ExitManager) Shutdown() {
 	em.mu.Unlock()
 }
 
-// RegisterCleanup registers a function to be executed during shutdown.
+// RegisterCleanup registers a function to execute during shutdown.
 //
-// Cleanup functions are executed in LIFO (Last In, First Out) order after all
-// shutdown locks have been released. The exit manager waits for all cleanup
-// functions to complete before terminating the process, unless a timeout expires.
+// Cleanup functions execute in LIFO order after all shutdown locks
+// are released. The exit manager waits for all cleanup functions
+// to complete before terminating (unless timeout expires).
 //
-// Cleanup functions should:
-//   - Complete quickly and not block indefinitely
-//   - Handle their own error recovery
-//   - Not acquire new shutdown locks
+// Cleanup functions should be quick, handle errors internally,
+// and not acquire new shutdown locks.
 //
 // Example:
 //
-//	var db = &sql.DB{}
 //	em.RegisterCleanup(func() {
-//	    log.Println("Closing database connections...")
-//	    db.Close()
+//		log.Println("Closing database...")
+//		db.Close()
 //	})
 func (em *ExitManager) RegisterCleanup(f func()) {
 	em.mu.Lock()
@@ -295,12 +271,11 @@ func (em *ExitManager) RegisterCleanup(f func()) {
 	em.mu.Unlock()
 }
 
-// WithCancel returns a context that is automatically cancelled when shutdown begins.
+// WithCancel returns a context that cancels automatically on shutdown.
 //
-// This provides integration with Go's context cancellation patterns. The returned
-// cancel function should still be called to free resources, similar to [context.WithCancel].
-//
-// If shutdown has already been initiated, the returned context will already be cancelled.
+// Integrates with Go's context cancellation patterns. The returned
+// cancel function should still be called to free resources.
+// If shutdown has already begun, the context is already cancelled.
 //
 // Example:
 //
@@ -309,9 +284,9 @@ func (em *ExitManager) RegisterCleanup(f func()) {
 //
 //	select {
 //	case <-ctx.Done():
-//	    // Shutdown initiated, cleanup and exit
+//		// Shutdown initiated
 //	case <-workComplete:
-//	    // Normal completion
+//		// Normal completion
 //	}
 func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
@@ -344,7 +319,7 @@ func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context
 	return ctx, cleanup
 }
 
-// listenForSignals registers signal handler and manages the shutdown process.
+// listenForSignals handles signal registration and coordinates the shutdown process.
 func (em *ExitManager) listenForSignals() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

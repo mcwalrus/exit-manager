@@ -1,15 +1,14 @@
 # Exit Manager
 
-`exitmanager` is a Go library that provides graceful shutdown coordination for applications, ensuring critical operations complete before process termination.
+A Go library that provides **graceful shutdown coordination** for applications, ensuring critical operations complete before process termination. You can additionally manage cleanup and ensure process exit.
 
-## Key Features
+## Features
 
-- 🛡️ **Safe Shutdown**: Prevents shutdown during critical operations using locks
-- 🔄 **Signal Handling**: Automatically listens for SIGINT/SIGTERM or shutdown signals
-- 🎯 **Context Integration**: Register cancellation contexts on notified shutdown
-- 🧹 **Cleanup Coordination**: Executes cleanup functions in reverse registration order
-- 📡 **Shutdown Notifications**: Notify goroutines when notified shutdown begins
-- ⏱️ **Timeout Support**: Configurable forced exit after timeout
+1. **Signal Handling**: Registers listener for SIGINT (Ctrl+C) and SIGTERM
+2. **Notifications**: When shutdown starts, the `Notify()` channel closes
+3. **Lock Coordination**: Waits for all shutdown locks to be released
+4. **Cleanup Execution**: Runs cleanup functions in reverse registration order  
+5. **Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
 
 ## Installation
 
@@ -17,88 +16,62 @@
 go get github.com/mcwarlus/exit-manager
 ```
 
-## When to Use?
+## Testing
 
-**1) Critical Process Management**
+Test with race condition detection:
 
-Use exit-manager when you have multiple goroutines performing critical work that must complete before the application shuts down. The lock system ensures no operations are interrupted mid-process unless a timeout is set.
+```bash
+go test -race .
+```
 
-**2) Resource Cleanup**
+## API
 
-Use exit-manager when you need to guarantee or manage cleanup functions execute in a specific order during shutdown (database connections, file handles, network connections, etc).
+### Timeout Protection
 
-## Best Practices
-
-1. **Always pair locks**: Every `AcquireShutdownLock()` must have a corresponding `ReleaseShutdownLock()`
-2. **Use defer**: Always use `defer em.ReleaseShutdownLock()` immediately after acquiring a lock
-3. **Check lock acquisition**: Always check the error from `AcquireShutdownLock()`
-5. **Set timeouts**: Use `SetTimeout()` to avoid hanging during process shutdown
-4. **Quick cleanup**: Keep cleanup functions fast and non-blocking
-
-## Quick Start
-
-### Basic Usage
+Prevent hanging during shutdown by setting a timeout:
 
 ```go
-package main
+em := exitmanager.Global()
+em.SetTimeout(30 * time.Second) // Force exit after 30 seconds
 
-import (
-	"log"
-	"time"
+// If cleanup takes too long, the process exits with code 1
+// If cleanup completes normally, the process exits with code 0
+```
 
-	exitmanager "github.com/mcwalrus/exit-manager"
-)
+### Programmatic Shutdown
 
-func main() {
-	em := exitmanager.Global()
+Trigger shutdown from your code:
 
-	// Register cleanup functions
-	em.RegisterCleanup(func() {
-		log.Println("Closing database connections...")
-	})
+```go
+em := exitmanager.Global()
 
-	em.RegisterCleanup(func() {
-		log.Println("Stopping background workers...")
-	})
+// Trigger shutdown programmatically (same as Ctrl+C)
+go func() {
+    time.Sleep(10 * time.Second)
+    em.Shutdown()
+}()
 
-	// Set a timeout for forced shutdown
-	em.SetTimeout(30 * time.Second)
+<-em.Notify() // Will trigger after 10 seconds
+```
 
-	// Shutdown process after sleep
-	go func() {
-		time.Sleep(10 * time.Second)
-		em.Shutdown()
-        log.Println("Shutdown has occurred on main routine")
-	}()
+### Monitoring Active Locks
 
-	for {
-		// Protect critical operation
-		if err := em.AcquireShutdownLock(); err != nil {
-			log.Printf("Worker: shutdown in progress, exiting")
-			return
-		}
-		// Simulate work release lock
-		log.Printf("Worker: processing...")
-		time.Sleep(2 * time.Second)
-		em.ReleaseShutdownLock()
+Check how many operations are preventing shutdown:
 
-		// Check for notified shutdown
-		select {
-		case <-em.Notify():
-			log.Printf("Worker: received shutdown signal")
-			return
-		default:
-			// Continue working
-		}
-	}
+```go
+em := exitmanager.Global()
+
+// Check active locks
+if locks := em.Locks(); locks > 0 {
+    log.Printf("Waiting for %d operations to complete...", locks)
 }
 ```
 
-### Shutdown Locks
+## Basic Usage
 
-You can acquire multiple shutdown locks at once to protect critical operations from the process shutdown.
+### Shutdown Routinues
 
-The exit manager will only exit the process once all remaining locks are released:
+Use when you have go routinues which you want to exit on notified shutdown.
 
 ```go
 package main
@@ -106,63 +79,160 @@ package main
 import (
     "log"
     "time"
-    
+
     exitmanager "github.com/mcwalrus/exit-manager"
 )
 
 func main() {
     em := exitmanager.Global()
 
-    // Shutdown process after sleep
-    go func () {
-        time.Sleep(10 * time.Second)
-        em.Shutdown()
-        log.Println("Shutdown has occurred on main routine")
-    }()
+    // Start a background worker
+    go backgroundWorker(em)
 
-    // Start worker goroutines
-    for i := 0; i < 3; i++ {
-        go doWork(i)
-    }
-
-    // Wait for shutdown signal
+    // Wait for shutdown signal (Ctrl+C)
     <-em.Notify()
-    log.Println("Shutdown initiated, waiting for workers...")
-    
-    // Wait forever, exit-manager to exit process
+    log.Println("Shutdown signal received, exiting gracefully...")
+
+    // Avoids exit on main routine
     select {}
 }
 
-func doWork(id int) {
-    em := exitmanager.Global()
-    
+func backgroundWorker(em *exitmanager.ExitManager) {
+    ticker := time.NewTicker(2 * time.Second)
+    defer ticker.Stop()
+
     for {
-        // Protect critical operation
-        if err := em.AcquireShutdownLock(); err != nil {
-            log.Printf("Worker %d: shutdown in progress, exiting", id)
-            return
-        }
-        
-        // Simulate work, release lock
-        log.Printf("Worker %d: processing...", id)
-        time.Sleep(3 * time.Second)
-        em.ReleaseShutdownLock()
-        
-        // Check if shutdown was initiated
         select {
         case <-em.Notify():
-            log.Printf("Worker %d: received shutdown signal", id)
+            log.Println("Worker: shutdown signal received, stopping...")
             return
-        default:
-            // Continue working
+        case <-ticker.C:
+            log.Println("Worker: doing work...")
         }
     }
 }
 ```
 
+### Shutdown Locks
+
+Use when you have operations that must complete before shutdown. The program won't exit until all shutdown locks are released.
+
+```go
+package main
+
+import (
+    "log"
+    "time"
+
+    exitmanager "github.com/mcwalrus/exit-manager"
+)
+
+func main() {
+    em := exitmanager.Global()
+
+    // Start workers that do critical operations
+    for i := 0; i < 3; i++ {
+        go criticalWorker(em, i)
+    }
+
+    // Wait for shutdown signal
+    <-em.Notify()
+    log.Println("Shutdown initiated, waiting for critical operations...")
+    
+    // Avoids exit on main routine
+    select {}
+}
+
+func criticalWorker(em *exitmanager.ExitManager, id int) {
+    for {
+        // Check if shutdown has started
+        select {
+        case <-em.Notify():
+            log.Printf("Worker %d: received shutdown signal, exiting", id)
+            return
+        default:
+        }
+
+        // Protect critical operation with a shutdown lock
+        if err := em.AcquireShutdownLock(); err != nil {
+            log.Printf("Worker %d: shutdown in progress, cannot start new work", id)
+            return
+        }
+
+        // Simulate work ...
+        log.Printf("Worker %d: starting critical operation...", id)
+        time.Sleep(3 * time.Second)
+        log.Printf("Worker %d: critical operation complete", id)
+        em.ReleaseShutdownLock()
+
+        // Small delay before next operation
+        time.Sleep(1 * time.Second)
+    }
+}
+```
+
+### Cleanup Functions
+
+Use when you need to clean up resources (close files, database connections, etc.) in a specific order. Registered cleanup functions run in reverse order.
+
+```go
+package main
+
+import (
+    "log"
+    "time"
+
+    exitmanager "github.com/mcwalrus/exit-manager"
+)
+
+// Simulate resources that need cleanup
+var database *Database
+var cache *Cache
+
+type Database struct{ name string }
+func (db *Database) Close() { log.Printf("Closing %s database...", db.name) }
+
+type Cache struct{ name string }
+func (c *Cache) Close() { log.Printf("Closing %s cache...", c.name) }
+
+func main() {
+    em := exitmanager.Global()
+
+    // Initialise resources
+    database = &Database{name: "user"}
+    cache = &Cache{name: "session"}
+
+    // Register cleanup functions
+    em.RegisterCleanup(func() {
+        log.Println("Step 1: Closing database connections")
+        database.Close()
+    })
+
+    em.RegisterCleanup(func() {
+        log.Println("Step 2: Flushing cache") 
+        cache.Close()
+    })
+
+    em.RegisterCleanup(func() {
+        log.Println("Step 3: Final cleanup")
+        log.Println("All resources cleaned up!")
+    })
+
+    // Do some work
+    log.Println("Application running... Press Ctrl+C to shutdown")
+    
+    // Wait for shutdown
+    <-em.Notify()
+    log.Println("Shutdown started...")
+    
+    // Exit manager will run cleanup functions and exit
+    select {}
+}
+```
+
 ### Context Integration
 
-You can register contexts with the exit-manager to be cancelled on notified shutdown.
+Use when you have long-running operations that should be cancelled on shutdown. When shutdown starts, registered contexts are automatically cancelled, cleanly stopping the long-running operation.
 
 ```go
 package main
@@ -171,58 +241,46 @@ import (
     "context"
     "log"
     "time"
-    "github.com/mcwalrus/exit-manager"
+
+    exitmanager "github.com/mcwalrus/exit-manager"
 )
 
 func main() {
     em := exitmanager.Global()
-    
-    // Create context that cancels on shutdown
+
+    // Create a context that cancels automatically on shutdown
     ctx, cancel := em.WithCancel(context.Background())
     defer cancel()
+
+    // Start long-running operation
+    go longRunningTask(ctx)
+
+    // Wait for shutdown
+    <-em.Notify()
+    log.Println("Shutdown initiated...")
     
-    go backgroundTask(ctx)
-
-    // Cleanup avoids immediate exit
-    em.RegisterCleanup(func() {
-        time.Sleep(5 * time.Second)
-    })
-
-    // Sleep then signal for shutdown
-    time.Sleep(10 * time.Second)
-    em.Shutdown()
-    log.Println("Shutdown has occurred on main routine")
-
-    // Wait for manager to exit process 
+    // The context is automatically cancelled, stopping the long-running task
     select {}
 }
 
-func backgroundTask(ctx context.Context) {
-    ticker := time.NewTicker(3 * time.Second)
+func longRunningTask(ctx context.Context) {
+    ticker := time.NewTicker(1 * time.Second)
     defer ticker.Stop()
     for {
         select {
         case <-ctx.Done():
-            log.Println("Background task received shutdown signal")
+            log.Println("Long-running task: context cancelled, stopping...")
             return
         case <-ticker.C:
-            log.Println("Background task working...")
+            log.Println("Long-running task: processing...")
         }
     }
 }
 ```
 
-## Test
-
-To test the library, please use the race condition checker:
-
-```
-$ go test -race .
-```
-
 ## Contributing
 
-Please report any issues or feature requests to the [GitHub repository](https://github.com/mcwalrus/exitmanager).
+Report issues and feature requests at the [GitHub repository](https://github.com/mcwalrus/exitmanager).
 
 ## License
 
