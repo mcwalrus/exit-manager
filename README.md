@@ -1,6 +1,6 @@
 # Exit Manager
 
-A Go library that provides **graceful shutdown coordination** for applications, ensuring critical operations complete before process termination. You can additionally manage cleanup and ensure process exit.
+A Go library that provides **graceful shutdown coordination** for applications, ensuring critical operations complete before process termination. You can additionally manage cleanup and ensuring process exit. For more information, please see the documentation at: https://pkg.go.dev/github.com/mcwalrus/exit-manager.
 
 ## Features
 
