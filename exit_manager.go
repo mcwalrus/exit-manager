@@ -50,7 +50,6 @@ import (
 	"errors"
 	"os"
 	"os/signal"
-	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -332,8 +331,9 @@ func (em *ExitManager) listenForSignals() {
 			if locks > 0 {
 				<-em.locksCh
 			}
-
-			slices.Reverse(cleanups)
+			for i, j := 0, len(cleanups)-1; i < j; i, j = i+1, j-1 {
+				cleanups[i], cleanups[j] = cleanups[j], cleanups[i]
+			}
 			for _, f := range cleanups {
 				f()
 			}
