@@ -57,15 +57,6 @@ import (
 )
 
 // ExitManager coordinates graceful application shutdowns.
-//
-// Key features:
-//   - Signal handling: Automatically listens for SIGINT/SIGTERM
-//   - Shutdown locks: Prevent shutdown during critical operations
-//   - Cleanup functions: Execute registered cleanup in reverse order
-//   - Notifications: Notify goroutines when shutdown begins
-//   - Timeouts: Configurable forced exit after timeout
-//   - Context integration: Cancel contexts on shutdown
-//
 // Use Global() to get the singleton instance.
 type ExitManager struct {
 	mu       *sync.RWMutex
@@ -135,12 +126,13 @@ func Global() *ExitManager {
 
 // SetTimeout configures the maximum shutdown duration before forced exit.
 //
+// If timeout is set to zero or less, the exit manager waits indefinitely for graceful shutdown.
+// If timeout expires, exits with code 1 and can interrupt cleanup.
 // The timeout covers the entire shutdown process:
 //   - Waiting for shutdown locks to be released
 //   - Executing cleanup functions
 //
-// If timeout <= 0, waits indefinitely for graceful shutdown.
-// If timeout expires, exits with code 1 (may interrupt cleanup).
+// Consider the time required for cleanup functions to ensure successful shutdown.
 func (em *ExitManager) SetTimeout(timeout time.Duration) {
 	em.mu.Lock()
 	em.timeout = timeout
@@ -148,7 +140,6 @@ func (em *ExitManager) SetTimeout(timeout time.Duration) {
 }
 
 // Locks returns the current number of active shutdown locks.
-//
 // Useful for monitoring shutdown progress. A non-zero value indicates
 // critical operations are still preventing shutdown completion.
 //
@@ -168,7 +159,6 @@ func (em *ExitManager) Locks() int {
 // Returns an error if shutdown has already been initiated, allowing
 // the caller to abort the operation gracefully. Each successful call
 // must be paired with exactly one call to ReleaseShutdownLock().
-//
 // Multiple locks can be acquired; shutdown waits for all to be released.
 //
 // Example:
@@ -195,8 +185,6 @@ func (em *ExitManager) AcquireShutdownLock() error {
 // Must be called exactly once for each successful AcquireShutdownLock().
 // If this releases the last lock and shutdown has been initiated,
 // the shutdown process proceeds to execute cleanup functions.
-//
-// Safe to call even without acquired locks (programming error).
 func (em *ExitManager) ReleaseShutdownLock() {
 	em.mu.Lock()
 	if em.locks > 0 {
@@ -229,16 +217,17 @@ func (em *ExitManager) Notify() <-chan struct{} {
 	return em.notifyCh
 }
 
-// Shutdown programmatically initiates the shutdown process.
+// Shutdown programmatically initiates the shutdown process:
 //
-// Has the same effect as receiving SIGINT/SIGTERM. Safe to call multiple times.
-// This method is non-blocking.
-//
-// Shutdown process:
 //  1. Close the notification channel (Notify())
 //  2. Wait for all shutdown locks to be released
 //  3. Execute cleanup functions in reverse registration order
 //  4. Exit the process
+//
+// Shutdown has the same effect as receiving SIGINT/SIGTERM.
+// The method is non-blocking and is safe to call multiple times.
+// The programatic shutdown might be useful for handling critical errors
+// more gracefully than a panic or direct exit.
 func (em *ExitManager) Shutdown() {
 	em.mu.Lock()
 	select {
@@ -255,7 +244,6 @@ func (em *ExitManager) Shutdown() {
 // Cleanup functions execute in LIFO order after all shutdown locks
 // are released. The exit manager waits for all cleanup functions
 // to complete before terminating (unless timeout expires).
-//
 // Cleanup functions should be quick, handle errors internally,
 // and not acquire new shutdown locks.
 //
@@ -271,11 +259,13 @@ func (em *ExitManager) RegisterCleanup(f func()) {
 	em.mu.Unlock()
 }
 
-// WithCancel returns a context that cancels automatically on shutdown.
+// WithCancel returns a context registered to be cancelled on shutdown.
 //
-// Integrates with Go's context cancellation patterns. The returned
+// Integrates with Go's context cancellation patterns where the returned
 // cancel function should still be called to free resources.
 // If shutdown has already begun, the context is already cancelled.
+// You can consider context cancellation as an alternative way to stop
+// long-running operations rather than the Notify() channel.
 //
 // Example:
 //
