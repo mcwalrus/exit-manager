@@ -13,7 +13,16 @@ import (
 // testExitManager returns a fresh ExitManager instance for testing.
 func testHTTPExitManager(t *testing.T) *HTTPExitManager {
 	t.Helper()
-	return newHTTPExitManager()
+	em := newHTTPExitManager()
+	go em.listenForSignals()
+	return em
+}
+
+// isShutdown returns true if the exit manager has been notified to shutdown.
+func (em *HTTPExitManager) isShutdown() bool {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	return em.notified
 }
 
 // mockServer creates a mock HTTP server for testing.
@@ -199,7 +208,7 @@ func TestConcurrency(t *testing.T) {
 	})
 }
 
-func TestDoneAndIsShutdown(t *testing.T) {
+func TestDoneAndisShutdown(t *testing.T) {
 	t.Parallel()
 
 	t.Run("Done channel closes after shutdown completes", func(t *testing.T) {
@@ -212,14 +221,14 @@ func TestDoneAndIsShutdown(t *testing.T) {
 		default:
 		}
 
-		if em.IsShutdown() {
-			t.Error("IsShutdown should return false before shutdown")
+		if em.isShutdown() {
+			t.Error("isShutdown should return false before shutdown")
 		}
 
 		em.Shutdown()
 
-		if !em.IsShutdown() {
-			t.Error("IsShutdown should return true after shutdown")
+		if !em.isShutdown() {
+			t.Error("isShutdown should return true after shutdown")
 		}
 
 		// Done channel should close

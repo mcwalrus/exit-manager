@@ -1,6 +1,10 @@
 # Exit Manager
 
-A Go library that provides **graceful shutdown coordination** for applications, ensuring critical operations complete before process termination. You can additionally manage cleanup and ensuring process exit. For more information, please see the documentation at: https://pkg.go.dev/github.com/mcwalrus/exit-manager.
+A Go library that provides **graceful shutdown coordination** for applications, ensuring critical operations complete before process termination. 
+
+## Purpose
+
+The libraries aims to provide a simple yet powerful interface, providing cleanup handling, ensuring process exit, and managed HTTP server shutdowns. This library achieves all its functionality with zero external dependencies. For more information, please see the documentation at: https://pkg.go.dev/github.com/mcwalrus/exit-manager.
 
 ## Features
 
@@ -19,13 +23,6 @@ Compatible with Go 1.14+ versions:
 go get github.com/mcwarlus/exit-manager
 ```
 
-## Testing
-
-Test with race condition detection:
-
-```bash
-go test -race .
-```
 
 ## Try CLI First!
 
@@ -44,6 +41,14 @@ go run main.go
 5. Or try Ctrl+C to see real signal handling
 
 The CLI will provide a hands-on experience that will help you understand the concepts before reading the code examples below.
+
+## Testing
+
+Test with race condition detection:
+
+```bash
+go test -race .
+```
 
 ## API
 
@@ -88,7 +93,7 @@ if locks := em.Locks(); locks > 0 {
 }
 ```
 
-#### HTTP Server Shutdowns
+### HTTP Server Shutdowns
 
 Multiple HTTP servers shutdown can concurrently occur faster overall shutdown:
 
@@ -114,7 +119,7 @@ httpEM.RegisterHTTPServer(httpexit.HTTPServerShutdownConfig{
 // Both servers will shutdown concurrently when exit is triggered
 ```
 
-#### HTTP Pre-Shutdown Hooks
+### HTTP Pre-Shutdown Hooks
 
 Pre-shutdown hooks execute before HTTP servers begin shutting down which is useful for closing hijacked server connections (such as websockets) ahead of server shutdowns:
 

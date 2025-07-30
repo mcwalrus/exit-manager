@@ -264,13 +264,6 @@ func (em *HTTPExitManager) Shutdown() {
 	em.mu.Unlock()
 }
 
-// IsShutdown returns true if the exit manager has been notified to shutdown.
-func (em *HTTPExitManager) IsShutdown() bool {
-	em.mu.Lock()
-	defer em.mu.Unlock()
-	return em.notified
-}
-
 // Done returns a channel that closes when the shutdown process is complete.
 //
 // This is useful for testing and for coordinating with other shutdown processes.
