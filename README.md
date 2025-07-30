@@ -12,6 +12,8 @@ A Go library that provides **graceful shutdown coordination** for applications, 
 
 ## Installation
 
+Compatible with Go 1.14+ versions:
+
 ```bash
 go get github.com/mcwarlus/exit-manager
 ```
@@ -23,6 +25,24 @@ Test with race condition detection:
 ```bash
 go test -race .
 ```
+
+## Try CLI First!
+
+Before diving into the API examples, try the interactive CLI to see graceful shutdown in action:
+
+```bash
+cd cmd/exit-manager
+go run main.go
+```
+
+**Quick Demo Scenario:**
+1. Run the script: `go run`.
+2. Type `l` (enter) a few times to acquire locks
+3. Type `s` (enter) to trigger shutdown - notice it waits for locks!
+4. Type `u` (enter) to release locks and watch cleanup execute
+5. Or try Ctrl+C to see real signal handling
+
+The CLI will provide a hands-on experience that will help you understand the concepts before reading the code examples below.
 
 ## API
 
@@ -204,20 +224,19 @@ func main() {
 
     // Register cleanup functions
     em.RegisterCleanup(func() {
-        log.Println("Closing database connections")
+        log.Println("LIFO: first in last out.")
+    })
+
+    em.RegisterCleanup(func() {
+        log.Println("Closing database connections...")
         database.Close()
     })
 
     em.RegisterCleanup(func() {
-        log.Println("Close cache connections") 
+        log.Println("Close cache connections...") 
         cache.Close()
     })
 
-    em.RegisterCleanup(func() {
-        log.Println("All resources cleaned up!")
-    })
-
-    // Do some work
     log.Println("Application running... Press Ctrl+C to shutdown")
     
     // Wait for shutdown
