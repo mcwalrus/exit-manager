@@ -53,21 +53,24 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	httpexit "github.com/mcwalrus/exit-manager/http-exit"
 )
 
 // ExitManager coordinates graceful application shutdowns.
 // Use Global() to get the singleton instance.
 type ExitManager struct {
-	mu       *sync.RWMutex
-	locks    int
-	notified bool
-	once     *sync.Once
-	timeout  time.Duration
-	locksCh  chan struct{}
-	notifyCh chan struct{}
-	shutdown chan struct{}
-	cleanups []func()
-	exit     exitHandler
+	mu              *sync.RWMutex
+	locks           int
+	notified        bool
+	once            *sync.Once
+	timeout         time.Duration
+	locksCh         chan struct{}
+	notifyCh        chan struct{}
+	shutdown        chan struct{}
+	cleanups        []func()
+	httpExitManager httpExitManager
+	exit            exitHandler
 }
 
 var (
@@ -308,6 +311,44 @@ func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context
 	return ctx, cleanup
 }
 
+// httpExitManager defines the interface for HTTP server shutdown coordination.
+// This allows the base exit manager to coordinate with HTTP-specific shutdown logic
+// without creating a direct dependency on the HTTP exit manager package.
+type httpExitManager interface {
+	Shutdown()
+	Done() <-chan struct{}
+}
+
+// RegisterHTTPExitManager registers and returns the HTTP exit manager for [net/http.Server]
+// shutdown coordination.
+//
+// This integrates with [net/http.Server shutdown coordination with the base exit manager,
+// ensuring that HTTP servers are gracefully shutdown first, before checking locks
+// and executing other cleanup functions. This is a global instance and can be accessed
+// safely across concurrent goroutines.
+//
+// Example:
+//
+//	// Register and configure HTTP exit manager
+//	em := exitmanager.Global()
+//	httpEM := em.RegisterHTTPExitManager()
+//	httpEM.RegisterHTTPServer(httpexit.HTTPServerShutdownConfig{
+//		Server: server,
+//		Timeout: 30 * time.Second,
+//	})
+//
+//	// Wait for shutdown
+//	<-em.Notify()
+func (em *ExitManager) RegisterHTTPExitManager() *httpexit.HTTPExitManager {
+	httpEM := httpexit.Global()
+
+	em.mu.Lock()
+	em.httpExitManager = httpEM
+	em.mu.Unlock()
+
+	return httpEM
+}
+
 // listenForSignals handles signal registration and coordinates the shutdown process.
 func (em *ExitManager) listenForSignals() {
 	sigCh := make(chan os.Signal, 1)
@@ -322,12 +363,17 @@ func (em *ExitManager) listenForSignals() {
 		em.mu.Lock()
 		em.notified = true
 		cleanups := append([]func(){}, em.cleanups...)
+		httpExitManager := em.httpExitManager
 		close(em.notifyCh)
 		locks := em.locks
 		em.mu.Unlock()
 
 		done := make(chan struct{})
 		go func() {
+			if httpExitManager != nil {
+				httpExitManager.Shutdown()
+				<-httpExitManager.Done()
+			}
 			if locks > 0 {
 				<-em.locksCh
 			}

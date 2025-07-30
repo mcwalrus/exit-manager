@@ -9,6 +9,7 @@ A Go library that provides **graceful shutdown coordination** for applications, 
 3. **🔒 Lock Coordination**: Waits for all shutdown locks to be released
 4. **🧹 Cleanup Execution**: Runs cleanup functions in reverse registration order  
 5. **🚪 Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
+6. **🌐 HTTP Server Support**: Graceful coordination for HTTP servers
 
 ## Installation
 
@@ -85,6 +86,53 @@ em := exitmanager.Global()
 if locks := em.Locks(); locks > 0 {
     log.Printf("Waiting for %d operations to complete...", locks)
 }
+```
+
+#### HTTP Server Shutdowns
+
+Multiple HTTP servers shutdown can concurrently occur faster overall shutdown:
+
+```go
+// Register exit manager
+em := exitmanager.Global()
+httpEM := em.RegisterHTTPExitManager()
+
+// Main API server
+apiServer := &http.Server{Addr: ":8080", Handler: apiHandler}
+httpEM.RegisterHTTPServer(httpexit.HTTPServerShutdownConfig{
+    Server:  apiServer,
+    Timeout: 30 * time.Second,
+})
+
+// Metrics server
+metricsServer := &http.Server{Addr: ":8081", Handler: metricsServer}
+httpEM.RegisterHTTPServer(httpexit.HTTPServerShutdownConfig{
+    Server:  metricsServer,
+    Timeout: 10 * time.Second,
+})
+
+// Both servers will shutdown concurrently when exit is triggered
+```
+
+#### HTTP Pre-Shutdown Hooks
+
+Pre-shutdown hooks execute before HTTP servers begin shutting down which is useful for closing hijacked server connections (such as websockets) ahead of server shutdowns:
+
+```go
+// Register exit manager
+em := exitmanager.Global()
+httpEM := em.RegisterHTTPExitManager()
+
+// Multiple pre-shutdown hooks can be registered
+httpEM.RegisterPreShutdown(func() {
+    log.Println("Closing WebSocket connections...")
+    // Close WebSocket connections
+})
+
+httpEM.RegisterPreShutdown(func() {
+    log.Println("Terminating SSE streams...")
+    // Close server-sent event streams
+})
 ```
 
 ## Basic Usage
@@ -301,7 +349,7 @@ func longRunningTask(ctx context.Context) {
 }
 ```
 
-## Global Access
+### Global Access
 
 An example showing different routines accessing the global exit manager:
 
@@ -351,13 +399,86 @@ func backgroundWorker() {
 }
 ```
 
+## HTTP Server Integration
+
+For applications with HTTP servers, use the HTTP exit manager for coordinated shutdowns. HTTP servers are shutdown before any other operation. Pre-shutdown hooks will execute before HTTP servers begin shutting down, which is useful for closing streaming connections (such as websockets) ahead of server shutdowns.
+
+```go
+package main
+
+import (
+    "log"
+    "net/http"
+    "time"
+    
+    exitmanager "github.com/mcwalrus/exit-manager"
+    httpexit "github.com/mcwalrus/exit-manager/http-exit"
+)
+
+func main() {
+    // Create HTTP server
+    server := &http.Server{
+        Addr:    ":8080",
+        Handler: myHandler(),
+    }
+
+    // Set up HTTP exit manager
+    em := exitmanager.Global()
+    httpEM := em.RegisterHTTPExitManager()
+    
+    // Register pre-shutdown hook for WebSocket connections
+    httpEM.RegisterPreShutdown(func() {
+        log.Println("Closing WebSocket connections...")
+        closeActiveWebSockets()
+    })
+    
+    // Register HTTP server for graceful shutdown
+    err := httpEM.RegisterHTTPServer(httpexit.HTTPServerShutdownConfig{
+        Server:  server,
+        Timeout: 30 * time.Second,
+        HandleErr: func(err error) {
+            log.Printf("Server shutdown error: %v", err)
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Start server
+    go func() {
+        log.Println("Server starting on :8080")
+        if err := server.ListenAndServe(); err != http.ErrServerClosed {
+            log.Fatal(err)
+        }
+    }()
+
+    // Wait for shutdown signal
+    <-em.Notify()
+    log.Println("Shutdown initiated, servers shutting down gracefully...")
+    
+    // Exit manager handles the rest
+    select {}
+}
+
+func myHandler() http.Handler {
+    mux := http.NewServeMux()
+    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("Hello World"))
+    })
+    return mux
+}
+
+func closeActiveWebSockets() {
+    // Implement close of active WebSocket connections
+    // Ensures hijacked WebSocket connections don't prevent graceful shutdown
+}
+```
+
 ## Contributing
 
 Report issues and feature requests at the [GitHub repository](https://github.com/mcwalrus/exitmanager).
 
-In future I would look to provide a seperate sub-module for registering http.Server's.
-
-I am open to ideas of other integrations this library can provide.
+I am open to ideas of shutdown integrations this library can provide.
 
 ## License
 
