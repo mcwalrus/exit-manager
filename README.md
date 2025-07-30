@@ -476,9 +476,9 @@ func closeActiveWebSockets() {
 
 ## Contributing
 
-Report issues and feature requests at the [GitHub repository](https://github.com/mcwalrus/exitmanager).
+Report issues and feature requests at the [GitHub repository](https://github.com/mcwalrus/exitmanager). 
 
-I am open to ideas of shutdown integrations this library can provide.
+I'm open to any ideas of shutdown integrations this module can provide for the standard libary.
 
 ## License
 

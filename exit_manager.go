@@ -363,22 +363,21 @@ func (em *ExitManager) listenForSignals() {
 		em.mu.Lock()
 		em.notified = true
 		cleanups := append([]func(){}, em.cleanups...)
-		httpExitManager := em.httpExitManager
+		httpEM := em.httpExitManager
 		close(em.notifyCh)
 		locks := em.locks
 		em.mu.Unlock()
 
 		done := make(chan struct{})
 		go func() {
-			if httpExitManager != nil {
-				httpExitManager.Shutdown()
-				<-httpExitManager.Done()
+			if httpEM != nil {
+				<-httpEM.Done()
 			}
 			if locks > 0 {
 				<-em.locksCh
 			}
-			for i, j := 0, len(cleanups)-1; i < j; i, j = i+1, j-1 {
-				cleanups[i], cleanups[j] = cleanups[j], cleanups[i]
+			for i := len(cleanups) - 1; i >= 0; i-- {
+				cleanups[i]()
 			}
 			for _, f := range cleanups {
 				f()
