@@ -9,7 +9,7 @@ A Go library that provides **graceful shutdown coordination** for applications, 
 3. **🔒 Lock Coordination**: Waits for all shutdown locks to be released
 4. **🧹 Cleanup Execution**: Runs cleanup functions in reverse registration order  
 5. **🚪 Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
-6. **🌐 HTTP Server Support**: Graceful coordination for HTTP servers
+6. **🌐 HTTP Server Support**: Graceful shutdown coordination for HTTP servers
 
 ## Installation
 
@@ -87,53 +87,6 @@ em := exitmanager.Global()
 if locks := em.Locks(); locks > 0 {
     log.Printf("Waiting for %d operations to complete...", locks)
 }
-```
-
-### HTTP Server Shutdowns
-
-Multiple HTTP servers shutdown can concurrently occur faster overall shutdown:
-
-```go
-// Register exit manager
-em := exitmanager.Global()
-httpEM := em.RegisterHTTPExitManager()
-
-// Main API server
-apiServer := &http.Server{Addr: ":8080", Handler: apiHandler}
-httpEM.RegisterHTTPServer(httpexit.HTTPServerShutdownConfig{
-    Server:  apiServer,
-    Timeout: 30 * time.Second,
-})
-
-// Metrics server
-metricsServer := &http.Server{Addr: ":8081", Handler: metricsServer}
-httpEM.RegisterHTTPServer(httpexit.HTTPServerShutdownConfig{
-    Server:  metricsServer,
-    Timeout: 10 * time.Second,
-})
-
-// Both servers will shutdown concurrently when exit is triggered
-```
-
-### HTTP Pre-Shutdown Hooks
-
-Pre-shutdown hooks execute before HTTP servers begin shutting down which is useful for closing hijacked server connections (such as websockets) ahead of server shutdowns:
-
-```go
-// Register exit manager
-em := exitmanager.Global()
-httpEM := em.RegisterHTTPExitManager()
-
-// Multiple pre-shutdown hooks can be registered
-httpEM.RegisterPreShutdown(func() {
-    log.Println("Closing WebSocket connections...")
-    // Close WebSocket connections
-})
-
-httpEM.RegisterPreShutdown(func() {
-    log.Println("Terminating SSE streams...")
-    // Close server-sent event streams
-})
 ```
 
 ## Basic Usage
@@ -273,7 +226,7 @@ func main() {
 
     // Register cleanup functions
     em.RegisterCleanup(func() {
-        log.Println("LIFO: first in last out.")
+        log.Println("LIFO: first-in, last-out...")
     })
 
     em.RegisterCleanup(func() {
@@ -402,7 +355,55 @@ func backgroundWorker() {
 
 ## HTTP Server Integration
 
-For applications with HTTP servers, use the HTTP exit manager for coordinated shutdowns. HTTP servers are shutdown before any other operation. Pre-shutdown hooks will execute before HTTP servers begin shutting down, which is useful for closing streaming connections (such as websockets) ahead of server shutdowns.
+For applications with HTTP servers, use the `httpexit.HTTPExitManager` for coordinated shutdowns. Through the `ExitManager`, HTTP servers are to be shutdown before any other shutdown operation. Pre-shutdown hooks will execute before HTTP servers begin shutdowns occur, which is useful for closing hijacked server connections (such as websockets) ahead of server shutdowns if required.
+
+### HTTP Server Shutdowns
+
+Multiple HTTP servers shutdown occur concurrentlyfor faster overall shutdown:
+
+```go
+// Register exit manager
+em := exitmanager.Global()
+httpEM := em.RegisterHTTPExitManager()
+
+// Main API server
+apiServer := &http.Server{Addr: ":8080", Handler: apiHandler}
+httpEM.RegisterHTTPServer(httpexit.HTTPServerShutdownConfig{
+    Server:  apiServer,
+    Timeout: 30 * time.Second,
+})
+
+// Metrics server
+metricsServer := &http.Server{Addr: ":8081", Handler: metricsServer}
+httpEM.RegisterHTTPServer(httpexit.HTTPServerShutdownConfig{
+    Server:  metricsServer,
+    Timeout: 10 * time.Second,
+})
+// Both servers will shutdown concurrently when exit is triggered
+<-em.Notify()
+```
+
+### HTTP Pre-Shutdown Hooks
+
+Pre-shutdown hooks execute before HTTP servers begin shutting down which is useful for closing hijacked server connections ahead of server shutdowns:
+
+```go
+// Register exit manager
+em := exitmanager.Global()
+httpEM := em.RegisterHTTPExitManager()
+
+// Multiple pre-shutdown hooks can be registered
+httpEM.RegisterCleanup(func() {
+    log.Println("LIFO: first-in, last-out...")
+})
+
+httpEM.RegisterPreShutdown(func() {
+    log.Println("Closing websocket connections...")
+    // Close websocket connections
+})
+```
+
+### HTTP Shutdown Example
 
 ```go
 package main
