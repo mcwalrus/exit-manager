@@ -394,6 +394,7 @@ func (em *ExitManager) listenForSignals() {
 		em.mu.Unlock()
 
 		done := make(chan struct{})
+		startedCleanup := make(chan struct{})
 		go func() {
 			if httpEM != nil {
 				<-httpEM.Done()
@@ -401,23 +402,32 @@ func (em *ExitManager) listenForSignals() {
 			if locks > 0 {
 				<-em.locksCh
 			}
+			close(startedCleanup)
 			for i := len(cleanups) - 1; i >= 0; i-- {
 				cleanups[i]()
-			}
-			for _, f := range cleanups {
-				f()
 			}
 			close(done)
 		}()
 
-		// no timeout
-		if em.timeout <= 0 {
+		// no timeout set
+		if em.timeoutMode == TimeoutModeNone || em.timeout <= 0 {
 			<-done
 			em.exit.Exit(0)
 			return
 		}
 
-		// timeout set
+		// timeout mode is graceful
+		if em.timeoutMode == TimeoutModeGraceful {
+			<-startedCleanup
+			select {
+			case <-done:
+				em.exit.Exit(0)
+			case <-time.After(em.timeout):
+				em.exit.Exit(1)
+			}
+		}
+
+		// timeout mode is forceful
 		select {
 		case <-done:
 			em.exit.Exit(0)
