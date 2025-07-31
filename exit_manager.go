@@ -65,6 +65,7 @@ type ExitManager struct {
 	notified        bool
 	once            *sync.Once
 	timeout         time.Duration
+	timeoutMode     TimeoutMode
 	locksCh         chan struct{}
 	notifyCh        chan struct{}
 	shutdown        chan struct{}
@@ -117,6 +118,12 @@ func (ehi osExitHandler) Done() <-chan struct{} {
 //	em.RegisterCleanup(func() {
 //		log.Println("Shutting down...")
 //	})
+//
+//	// Waiting for Ctrl+C or Shutdown()
+//	<-em.Notify()
+//
+//	// Or programmatic shutdown
+//	// em.Shutdown()
 func Global() *ExitManager {
 	once.Do(func() {
 		em := newExitManager()
@@ -125,6 +132,18 @@ func Global() *ExitManager {
 	})
 	return manager
 }
+
+// TimeoutMode determines the behavior when the timeout expires.
+//
+// If you are concerned about process hanging during cleanup, release of locks,
+// or other issues, use TimeoutModeForceful.
+type TimeoutMode int
+
+const (
+	TimeoutModeNone     TimeoutMode = iota // Default mode, which is no timeout
+	TimeoutModeGraceful                    // Timeout is only applied to the cleanup functions
+	TimeoutModeForceful                    // Timeout is applied to the entire shutdown process
+)
 
 // SetTimeout configures the maximum shutdown duration before forced exit.
 //
@@ -135,8 +154,9 @@ func Global() *ExitManager {
 //   - Executing cleanup functions
 //
 // Consider the time required for cleanup functions to ensure successful shutdown.
-func (em *ExitManager) SetTimeout(timeout time.Duration) {
+func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
 	em.mu.Lock()
+	em.timeoutMode = mode
 	em.timeout = timeout
 	em.mu.Unlock()
 }
