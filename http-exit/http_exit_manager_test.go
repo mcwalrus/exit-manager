@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -23,6 +24,12 @@ func testHTTPExitManager(t *testing.T) *HTTPExitManager {
 	})
 
 	return em
+}
+
+func (em *HTTPExitManager) hasShutdown() bool {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	return em.notified
 }
 
 var httpHandler = http.HandlerFunc(
@@ -42,17 +49,6 @@ func waitForServerReady(server *httptest.Server, timeout time.Duration) bool {
 		resp, err := http.Get(server.URL)
 		if err == nil {
 			resp.Body.Close()
-			return true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return false
-}
-
-func waitForServerClosed(server *httptest.Server, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if serverIsClosed(server) {
 			return true
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -258,67 +254,54 @@ func TestRegisterHTTPServer(t *testing.T) {
 	})
 }
 
-// func TestConcurrency(t *testing.T) {
-// 	t.Parallel()
+func TestShutdown(t *testing.T) {
+	t.Parallel()
 
-// 	t.Run("multiple shutdown calls are safe", func(t *testing.T) {
-// 		em := testHTTPExitManager(t)
-// 		var shutdownCount int32
+	t.Run("Done closes after shutdown completes", func(t *testing.T) {
+		em := testHTTPExitManager(t)
 
-// 		em.RegisterPreShutdown(func() {
-// 			atomic.AddInt32(&shutdownCount, 1)
-// 		})
+		select {
+		case <-em.Done():
+			t.Error("Done channel should not be closed before shutdown")
+		default:
+		}
 
-// 		var wg sync.WaitGroup
-// 		n := 5
+		if em.hasShutdown() {
+			t.Error("hasShutdown should return false before shutdown")
+		}
 
-// 		// Call shutdown concurrently multiple times
-// 		wg.Add(n)
-// 		for i := 0; i < n; i++ {
-// 			go func() {
-// 				defer wg.Done()
-// 				em.Shutdown()
-// 			}()
-// 		}
+		em.Shutdown()
 
-// 		wg.Wait()
-// 		<-em.Done()
+		if !em.hasShutdown() {
+			t.Error("hasShutdown should return true after shutdown")
+		}
 
-// 		// Pre-shutdown hook should only execute once
-// 		if count := atomic.LoadInt32(&shutdownCount); count != 1 {
-// 			t.Errorf("expected shutdown to execute once, got %d times", count)
-// 		}
-// 	})
-// }
+		// Done channel should close
+		select {
+		case <-em.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Error("Done channel should close after shutdown")
+		}
+	})
 
-// func TestDoneAndhasShutdown(t *testing.T) {
-// 	t.Parallel()
+	t.Run("multiple shutdown calls are safe", func(t *testing.T) {
+		em := testHTTPExitManager(t)
+		var wg sync.WaitGroup
+		n := 5
 
-// 	t.Run("Done channel closes after shutdown completes", func(t *testing.T) {
-// 		em := testHTTPExitManager(t)
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				em.Shutdown()
+			}()
+		}
 
-// 		// Done channel should not be closed initially
-// 		select {
-// 		case <-em.Done():
-// 			t.Error("Done channel should not be closed before shutdown")
-// 		default:
-// 		}
-
-// 		if em.hasShutdown() {
-// 			t.Error("hasShutdown should return false before shutdown")
-// 		}
-
-// 		em.Shutdown()
-
-// 		if !em.hasShutdown() {
-// 			t.Error("hasShutdown should return true after shutdown")
-// 		}
-
-// 		// Done channel should close
-// 		select {
-// 		case <-em.Done():
-// 		case <-time.After(100 * time.Millisecond):
-// 			t.Error("Done channel should close after shutdown")
-// 		}
-// 	})
-// }
+		wg.Wait()
+		select {
+		case <-em.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Error("Done channel should close after multiple shutdown calls")
+		}
+	})
+}
