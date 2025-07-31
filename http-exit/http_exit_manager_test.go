@@ -3,8 +3,6 @@ package httpexit
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -164,51 +162,30 @@ func TestRegisterHTTPServer(t *testing.T) {
 	t.Run("error handling on server.Shutdown", func(t *testing.T) {
 		em := testHTTPExitManager(t)
 
-		// Create a real HTTP server with a listener to simulate proper shutdown behavior
+		// Handler config
+		timeout := 3 * time.Second
 		connEstablished := make(chan struct{})
+
+		// Handler to keep the connection alive and prevent graceful shutdown
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			close(connEstablished)
-			// Start writing response but block to prevent graceful shutdown
 			w.Header().Set("Content-Length", "100")
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("partial"))
-			// Block to keep the connection alive and prevent graceful shutdown
-			time.Sleep(10 * time.Second)
+			time.Sleep(timeout)
 		})
 
-		// Create listener to get actual address
-		listener, err := net.Listen("tcp", "localhost:0")
-		if err != nil {
-			t.Fatalf("failed to create listener: %v", err)
-		}
-		defer listener.Close()
-
-		// Create a proper HTTP server
-		server := &http.Server{
-			Handler: handler,
-		}
-
-		// Start server in background
-		go func() {
-			err := server.Serve(listener)
-			if err != nil && err != http.ErrServerClosed {
-				t.Errorf("server error: %v", err)
-			}
-		}()
+		// Create server with handler
+		server := httptest.NewServer(handler)
+		t.Cleanup(server.Close)
 
 		// Wait a moment for server to start
 		time.Sleep(50 * time.Millisecond)
 
-		serverURL := fmt.Sprintf("http://%s", listener.Addr().String())
-
-		t.Cleanup(func() {
-			server.Close()
-		})
-
 		// Make request to establish connection that will block shutdown
 		// Try to read response (will be interrupted by server shutdown)
 		go func() {
-			resp, err := http.Get(serverURL)
+			resp, err := http.Get(server.URL)
 			if err != nil {
 				return
 			}
@@ -230,9 +207,9 @@ func TestRegisterHTTPServer(t *testing.T) {
 
 		// Register server with cancelled context
 		var handledErr error
-		err = em.RegisterHTTPServer(HTTPServerShutdownConfig{
+		err := em.RegisterHTTPServer(HTTPServerShutdownConfig{
 			Ctx:    ctx,
-			Server: server,
+			Server: server.Config,
 			HandleErr: func(err error) {
 				handledErr = err
 			},
