@@ -72,6 +72,7 @@ type HTTPExitManager struct {
 	notified      bool
 	preShutdowns  []func()
 	httpShutdowns []func()
+	notify        chan struct{}
 	shutdown      chan struct{}
 	done          chan struct{}
 }
@@ -236,6 +237,12 @@ func (em *HTTPExitManager) RegisterHTTPServer(cfg HTTPServerShutdownConfig) erro
 	return nil
 }
 
+// Notify returns a channel that closes when the HTTP exit manager is notified
+// of shutdown. This is used to coordinate shutdown with the base exit manager.
+func (em *HTTPExitManager) Notify() <-chan struct{} {
+	return em.notify
+}
+
 // Shutdown initiates the HTTP server shutdown process.
 //
 // This method coordinates the two-phase shutdown:
@@ -294,6 +301,7 @@ func (em *HTTPExitManager) listenForSignals() {
 		em.notified = true
 		preShutdowns := append([]func(){}, em.preShutdowns...)
 		httpShutdowns := append([]func(){}, em.httpShutdowns...)
+		close(em.notify)
 		em.mu.Unlock()
 
 		defer func() {

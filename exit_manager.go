@@ -366,6 +366,11 @@ func (em *ExitManager) RegisterHTTPExitManager() *httpexit.HTTPExitManager {
 	em.httpExitManager = httpEM
 	em.mu.Unlock()
 
+	go func() {
+		<-httpEM.Notify()
+		em.Shutdown()
+	}()
+
 	return httpEM
 }
 
