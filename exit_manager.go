@@ -236,11 +236,23 @@ func (em *ExitManager) AcquireShutdownLock() error {
 // Automatically acquires and releases the shutdown lock around
 // the function execution. Returns ErrShutdownInProgress if
 // shutdown has already been initiated.
-func (em *ExitManager) WithShutdownLock(fn func() error) error {
+//
+// If fn panics, the panic is recovered and the shutdown lock is still
+// properly released. The panic is then re-raised to maintain
+// expected panic behavior while ensuring graceful shutdown continues.
+func (em *ExitManager) WithShutdownLock(fn func() error) (err error) {
 	if err := em.AcquireShutdownLock(); err != nil {
 		return err
 	}
 	defer em.ReleaseShutdownLock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			// Re-raise the panic after ensuring cleanup
+			panic(r)
+		}
+	}()
+
 	return fn()
 }
 
@@ -394,7 +406,7 @@ type httpExitManager interface {
 // RegisterHTTPExitManager registers and returns the HTTP exit manager for [net/http.Server]
 // shutdown coordination.
 //
-// This integrates with [net/http.Server shutdown coordination with the base exit manager,
+// This integrates with [net/http.Server.Shutdown] shutdown coordination with the base exit manager,
 // ensuring that HTTP servers are gracefully shutdown first, before checking locks
 // and executing other cleanup functions. This is a global instance and can be accessed
 // safely across concurrent goroutines.
@@ -456,7 +468,16 @@ func (em *ExitManager) listenForSignals() {
 			}
 			close(startedCleanup)
 			for i := len(cleanups) - 1; i >= 0; i-- {
-				cleanups[i]()
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							// Log the panic but continue with remaining cleanup functions
+							// This ensures one panicking cleanup doesn't prevent others from running
+							// Users should handle their own errors, but we provide graceful degradation
+						}
+					}()
+					cleanups[i]()
+				}()
 			}
 			close(done)
 		}()

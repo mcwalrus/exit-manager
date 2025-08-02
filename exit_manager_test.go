@@ -2,6 +2,7 @@ package exitmanager
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -629,5 +630,205 @@ func TestNotifyContext(t *testing.T) {
 		}
 
 		checkNoExit(t, em)
+	})
+}
+
+func TestPanicHandling(t *testing.T) {
+	t.Parallel()
+
+	t.Run("WithShutdownLock panics are recovered and re-raised", func(t *testing.T) {
+		em := testExitManager(t)
+
+		// This should panic after releasing the lock
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected panic to be re-raised")
+			} else if r != "test panic" {
+				t.Fatalf("unexpected panic value: %v", r)
+			}
+		}()
+
+		err := em.WithShutdownLock(func() error {
+			panic("test panic")
+		})
+
+		// Should not reach here
+		t.Fatalf("function should have panicked, but returned error: %v", err)
+	})
+
+	t.Run("WithShutdownLock releases lock even when panicking", func(t *testing.T) {
+		em := testExitManager(t)
+
+		// Acquire lock first to verify it increases
+		err := em.AcquireShutdownLock()
+		if err != nil {
+			t.Fatalf("unexpected error acquiring lock: %v", err)
+		}
+		if em.Locks() != 1 {
+			t.Fatalf("expected 1 lock, got %d", em.Locks())
+		}
+
+		// WithShutdownLock should panic but still release its lock
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			_ = em.WithShutdownLock(func() error {
+				if em.Locks() != 2 {
+					t.Fatalf("expected 2 locks during function execution, got %d", em.Locks())
+				}
+				panic("test panic")
+			})
+		}()
+
+		// Should be back to 1 lock (the manually acquired one)
+		if em.Locks() != 1 {
+			t.Fatalf("expected 1 lock after panic recovery, got %d", em.Locks())
+		}
+
+		// Release the manually acquired lock
+		em.ReleaseShutdownLock()
+		if em.Locks() != 0 {
+			t.Fatalf("expected 0 locks after release, got %d", em.Locks())
+		}
+	})
+
+	t.Run("cleanup function panics don't prevent other cleanups", func(t *testing.T) {
+		em := testExitManager(t)
+
+		executed := make([]string, 0)
+		var mu sync.Mutex
+
+		// Register cleanups that will execute in reverse order (LIFO)
+		em.RegisterCleanup(func() {
+			mu.Lock()
+			executed = append(executed, "cleanup1")
+			mu.Unlock()
+		})
+
+		em.RegisterCleanup(func() {
+			mu.Lock()
+			executed = append(executed, "cleanup2_panic")
+			mu.Unlock()
+			panic("cleanup panic")
+		})
+
+		em.RegisterCleanup(func() {
+			mu.Lock()
+			executed = append(executed, "cleanup3")
+			mu.Unlock()
+		})
+
+		// Shutdown should complete despite panic
+		em.Shutdown()
+
+		select {
+		case <-em.exit.Done():
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("expected exit manager to complete shutdown despite cleanup panic")
+		}
+
+		checkExitCode(t, em, 0)
+
+		// Verify all cleanups executed (in reverse order)
+		mu.Lock()
+		expected := []string{"cleanup3", "cleanup2_panic", "cleanup1"}
+		mu.Unlock()
+
+		if len(executed) != len(expected) {
+			t.Fatalf("expected %d cleanups to execute, got %d: %v", len(expected), len(executed), executed)
+		}
+
+		for i, exp := range expected {
+			if executed[i] != exp {
+				t.Fatalf("cleanup execution order mismatch at index %d: expected %s, got %s", i, exp, executed[i])
+			}
+		}
+	})
+
+	t.Run("multiple cleanup function panics don't prevent graceful exit", func(t *testing.T) {
+		em := testExitManager(t)
+
+		executed := make([]string, 0)
+		var mu sync.Mutex
+
+		// Register multiple panicking cleanups
+		for i := 0; i < 5; i++ {
+			name := fmt.Sprintf("cleanup%d", i)
+			em.RegisterCleanup(func() {
+				mu.Lock()
+				executed = append(executed, name)
+				mu.Unlock()
+				if name != "cleanup2" { // Only one should not panic
+					panic("cleanup panic: " + name)
+				}
+			})
+		}
+
+		em.Shutdown()
+
+		select {
+		case <-em.exit.Done():
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("expected exit manager to complete shutdown despite multiple cleanup panics")
+		}
+
+		checkExitCode(t, em, 0)
+
+		// All cleanups should have executed
+		mu.Lock()
+		if len(executed) != 5 {
+			t.Fatalf("expected 5 cleanups to execute, got %d: %v", len(executed), executed)
+		}
+		mu.Unlock()
+	})
+
+	t.Run("cleanup panics with timeout mode graceful", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetTimeout(TimeoutModeGraceful, 100*time.Millisecond)
+
+		executed := false
+		em.RegisterCleanup(func() {
+			executed = true
+			time.Sleep(50 * time.Millisecond) // Sleep within timeout
+			panic("cleanup panic")
+		})
+
+		em.Shutdown()
+
+		select {
+		case <-em.exit.Done():
+		case <-time.After(200 * time.Millisecond):
+			t.Fatal("expected exit manager to complete shutdown")
+		}
+
+		if !executed {
+			t.Fatal("cleanup function should have executed")
+		}
+
+		// Should exit successfully despite panic (panic doesn't affect timeout)
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("cleanup panics with timeout mode forceful", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetTimeout(TimeoutModeForceful, 50*time.Millisecond)
+
+		em.RegisterCleanup(func() {
+			panic("cleanup panic")
+		})
+
+		em.Shutdown()
+
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to complete shutdown")
+		}
+
+		// Should exit successfully despite panic
+		checkExitCode(t, em, 0)
 	})
 }

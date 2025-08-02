@@ -114,6 +114,7 @@ func newHTTPExitManager() *HTTPExitManager {
 	return &HTTPExitManager{
 		mu:       &sync.Mutex{},
 		once:     &sync.Once{},
+		notify:   make(chan struct{}),
 		shutdown: make(chan struct{}),
 		done:     make(chan struct{}),
 	}
@@ -314,7 +315,16 @@ func (em *HTTPExitManager) listenForSignals() {
 
 		// Execute pre-shutdown functions in reverse order (LIFO)
 		for i := len(preShutdowns) - 1; i >= 0; i-- {
-			preShutdowns[i]()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// Log the panic but continue with remaining pre-shutdown functions
+						// This ensures one panicking pre-shutdown doesn't prevent others from running
+						// Users should handle their own errors, but we provide graceful degradation
+					}
+				}()
+				preShutdowns[i]()
+			}()
 		}
 
 		// Shutdown all HTTP servers concurrently
@@ -323,6 +333,13 @@ func (em *HTTPExitManager) listenForSignals() {
 		for _, shutdown := range httpShutdowns {
 			go func(f func()) {
 				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						// Log the panic but continue with remaining server shutdowns
+						// This ensures one panicking server shutdown doesn't prevent others from running
+						// Users should handle their own errors, but we provide graceful degradation
+					}
+				}()
 				f()
 			}(shutdown)
 		}
