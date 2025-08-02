@@ -135,8 +135,9 @@ func Global() *ExitManager {
 
 // TimeoutMode determines the behavior when the timeout expires.
 //
-// If you are concerned about process hanging during cleanup, release of locks,
-// or other issues, use TimeoutModeForceful.
+// For most applications, TimeoutModeGraceful will be best. If you are
+// concerned about process hanging during cleanup, release of locks, or
+// other issues, use TimeoutModeForceful.
 type TimeoutMode int
 
 const (
@@ -190,16 +191,57 @@ func (em *ExitManager) Locks() int {
 //	}
 //	defer em.ReleaseShutdownLock()
 //	// Perform critical operation...
+// func (em *ExitManager) AcquireShutdownLock() error {
+// 	em.mu.Lock()
+// 	if em.notified {
+// 		em.mu.Unlock()
+// 		return errors.New("exit manager: shutdown in progress")
+// 	} else {
+// 		em.locks++
+// 		em.mu.Unlock()
+// 		return nil
+// 	}
+// }
+
+var ErrShutdownInProgress = errors.New("exit manager: shutdown in progress")
+
+// AcquireShutdownLock increments the shutdown lock counter.
+//
+// Returns ErrShutdownInProgress if shutdown has already been initiated.
+// Must be paired with exactly one call to ReleaseShutdownLock().
+// Critical operations should acquire a lock to prevent shutdown
+// from proceeding until the operation completes.
+//
+// Example:
+//
+//	if err := em.AcquireShutdownLock(); err != nil {
+//		return err // Shutdown in progress
+//	}
+//	defer em.ReleaseShutdownLock()
+//	// Perform critical operation...
 func (em *ExitManager) AcquireShutdownLock() error {
 	em.mu.Lock()
 	if em.notified {
 		em.mu.Unlock()
-		return errors.New("exit manager: shutdown in progress")
+		return ErrShutdownInProgress
 	} else {
 		em.locks++
 		em.mu.Unlock()
 		return nil
 	}
+}
+
+// WithShutdownLock executes fn while holding a shutdown lock.
+//
+// Automatically acquires and releases the shutdown lock around
+// the function execution. Returns ErrShutdownInProgress if
+// shutdown has already been initiated.
+func (em *ExitManager) WithShutdownLock(fn func() error) error {
+	if err := em.AcquireShutdownLock(); err != nil {
+		return err
+	}
+	defer em.ReleaseShutdownLock()
+	return fn()
 }
 
 // ReleaseShutdownLock decrements the shutdown lock counter.
@@ -281,17 +323,19 @@ func (em *ExitManager) RegisterCleanup(f func()) {
 	em.mu.Unlock()
 }
 
-// WithCancel returns a context registered to be cancelled on shutdown.
+// NotifyContext returns a context registered to be cancelled on shutdown.
 //
 // Integrates with Go's context cancellation patterns where the returned
 // cancel function should still be called to free resources.
 // If shutdown has already begun, the context is already cancelled.
 // You can consider context cancellation as an alternative way to stop
-// long-running operations rather than the Notify() channel.
+// long-running operations rather than the Notify() channel. The pattern
+// is similar to [signal.NotifyContext], but the context will also receive
+// the shutdown signal with calls to [ExitManager.Shutdown].
 //
 // Example:
 //
-//	ctx, cancel := em.WithCancel(context.Background())
+//	ctx, cancel := em.NotifyContext(context.Background())
 //	defer cancel()
 //
 //	select {
@@ -300,7 +344,7 @@ func (em *ExitManager) RegisterCleanup(f func()) {
 //	case <-workComplete:
 //		// Normal completion
 //	}
-func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context.CancelFunc) {
+func (em *ExitManager) NotifyContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	em.mu.RLock()
@@ -323,12 +367,20 @@ func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context
 	go func() {
 		select {
 		case <-done:
+		case <-ctx.Done():
+			cleanup()
 		case <-em.Notify():
 			cleanup()
 		}
 	}()
 
 	return ctx, cleanup
+}
+
+// WithCancel provides the same functionality as [ExitManager.NotifyContext].
+func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := em.NotifyContext(ctx)
+	return ctx, cancel
 }
 
 // httpExitManager defines the interface for HTTP server shutdown coordination.
@@ -425,6 +477,7 @@ func (em *ExitManager) listenForSignals() {
 			case <-time.After(em.timeout):
 				em.exit.Exit(1)
 			}
+			return
 		}
 
 		// timeout mode is forceful

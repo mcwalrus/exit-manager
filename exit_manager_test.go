@@ -44,22 +44,45 @@ type exitRecorder struct {
 	code        int
 	nExits      int
 	hasExitedCh chan (struct{})
+	closed      bool
 }
 
 func (er *exitRecorder) Exit(code int) {
 	er.mu.Lock()
+	defer er.mu.Unlock()
 	er.nExits++
 	er.code = code
-	close(er.hasExitedCh)
-	er.mu.Unlock()
+	if !er.closed {
+		close(er.hasExitedCh)
+		er.closed = true
+	}
 }
 
 func (er *exitRecorder) Done() <-chan struct{} {
 	return er.hasExitedCh
 }
 
-// checkManagerExitCode verifies the exit manager has exited with the expected code.
-func checkManagerExitCode(t *testing.T, em *ExitManager, code int) {
+// checkNoExit verifies the exit manager has not exited.
+func checkNoExit(t *testing.T, em *ExitManager) {
+	t.Helper()
+
+	er, ok := (em.exit).(*exitRecorder)
+	if !ok {
+		t.Fatalf("required em.hijackExitHandler() for testing")
+	}
+	er.mu.Lock()
+	defer er.mu.Unlock()
+
+	if er.closed {
+		t.Fatalf("exit manager was expected to not exit, but exited")
+	}
+	if er.nExits > 0 {
+		t.Fatalf("exit manager was expected to not exit, but exited %d times", er.nExits)
+	}
+}
+
+// checkExitCode verifies the exit manager has exited with the expected code.
+func checkExitCode(t *testing.T, em *ExitManager, code int) {
 	t.Helper()
 
 	er, ok := (em.exit).(*exitRecorder)
@@ -86,7 +109,8 @@ func TestAcquireShutdownLock(t *testing.T) {
 	t.Run("successful lock acquisition and release", func(t *testing.T) {
 		em := testExitManager(t)
 
-		if err := em.AcquireShutdownLock(); err != nil {
+		err := em.AcquireShutdownLock()
+		if err != nil {
 			t.Fatalf("expected lock acquisition to succeed, got error: %v", err)
 		}
 		if em.Locks() != 1 {
@@ -103,7 +127,8 @@ func TestAcquireShutdownLock(t *testing.T) {
 		em := testExitManager(t)
 
 		for i := 0; i < 3; i++ {
-			if err := em.AcquireShutdownLock(); err != nil {
+			err := em.AcquireShutdownLock()
+			if err != nil {
 				t.Fatalf("expected lock acquisition to succeed, got error: %v", err)
 			}
 		}
@@ -117,7 +142,8 @@ func TestAcquireShutdownLock(t *testing.T) {
 
 		// Acquiring three locks
 		for i := 0; i < 3; i++ {
-			if err := em.AcquireShutdownLock(); err != nil {
+			err := em.AcquireShutdownLock()
+			if err != nil {
 				t.Fatalf("expected lock acquisition to succeed, got error: %v", err)
 			}
 		}
@@ -141,14 +167,15 @@ func TestAcquireShutdownLock(t *testing.T) {
 			t.Fatal("expected exit manager to have exited after all locks are released")
 		}
 
-		checkManagerExitCode(t, em, 0)
+		checkExitCode(t, em, 0)
 	})
 
 	t.Run("lock acquired after shutdown returns an error", func(t *testing.T) {
 		em := testExitManager(t)
 
 		em.Shutdown()
-		if err := em.AcquireShutdownLock(); err == nil {
+		err := em.AcquireShutdownLock()
+		if err == nil {
 			t.Fatalf("expected lock acquisition to fail after shutdown started, got nil error")
 		}
 
@@ -158,7 +185,7 @@ func TestAcquireShutdownLock(t *testing.T) {
 			t.Fatal("expected exit manager to have exited after shutdown started")
 		}
 
-		checkManagerExitCode(t, em, 0)
+		checkExitCode(t, em, 0)
 	})
 
 	t.Run("concurrent lock acquisitions is thread safe", func(t *testing.T) {
@@ -212,9 +239,9 @@ func TestAcquireShutdownLock(t *testing.T) {
 func TestTimeout(t *testing.T) {
 	t.Parallel()
 
-	t.Run("timeout does not affect normal exit", func(t *testing.T) {
+	t.Run("timeout mode none does not affect normal exit", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetTimeout(50 * time.Millisecond)
+		em.SetTimeout(TimeoutModeNone, 50*time.Millisecond)
 
 		// Shutdown should exit normally
 		em.Shutdown()
@@ -224,45 +251,166 @@ func TestTimeout(t *testing.T) {
 			t.Fatal("expected exit manager to have exited after shutdown started")
 		}
 
-		checkManagerExitCode(t, em, 0)
+		checkExitCode(t, em, 0)
 	})
 
-	t.Run("timeout is respected on shutdown for held locks", func(t *testing.T) {
+	t.Run("timeout mode none waits indefinitely for locks", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetTimeout(50 * time.Millisecond)
+		em.SetTimeout(TimeoutModeNone, 50*time.Millisecond)
 
 		// Acquire lock
 		_ = em.AcquireShutdownLock()
 		em.Shutdown()
 
-		// Shutdown should block until timeout expires
+		// Should wait indefinitely, not timeout
+		select {
+		case <-em.exit.Done():
+			t.Fatal("expected exit manager to wait indefinitely, but it exited")
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		checkNoExit(t, em)
+	})
+
+	t.Run("timeout mode graceful applies timeout only to cleanup", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetTimeout(TimeoutModeGraceful, 50*time.Millisecond)
+
+		// Acquire lock
+		_ = em.AcquireShutdownLock()
+
+		// Add slow cleanup
+		em.RegisterCleanup(func() {
+			time.Sleep(100 * time.Millisecond)
+		})
+
+		em.Shutdown()
+
+		// Should wait for lock release (no timeout here)
+		select {
+		case <-em.exit.Done():
+			t.Fatal("expected exit manager to wait for lock release")
+		case <-time.After(25 * time.Millisecond):
+			// Expected - still waiting for lock
+		}
+
+		// Release lock - now cleanup should start and timeout
+		em.ReleaseShutdownLock()
 		select {
 		case <-em.exit.Done():
 		case <-time.After(100 * time.Millisecond):
-			t.Fatal("expected exit manager to have exited after shutdown started")
+			t.Fatal("expected exit manager to have exited after cleanup timeout")
 		}
 
-		checkManagerExitCode(t, em, 1)
+		checkExitCode(t, em, 1)
 	})
 
-	t.Run("timeout is respected on shutdown for blocked cleanup", func(t *testing.T) {
+	t.Run("timeout mode forceful applies timeout to entire shutdown", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetTimeout(50 * time.Millisecond)
+		em.SetTimeout(TimeoutModeForceful, 50*time.Millisecond)
 
-		// Block cleanup
+		// Acquire lock
+		_ = em.AcquireShutdownLock()
+		em.Shutdown()
+
+		// Should timeout even while waiting for locks
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have timed out during lock wait")
+		}
+
+		checkExitCode(t, em, 1)
+	})
+
+	t.Run("timeout mode graceful allows normal completion", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetTimeout(TimeoutModeGraceful, 50*time.Millisecond)
+
+		// Fast cleanup
 		em.RegisterCleanup(func() {
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 		})
 
-		// Shutdown should block until timeout expires
 		em.Shutdown()
 		select {
 		case <-em.exit.Done():
-		case <-time.After(100 * time.Millisecond):
-			t.Fatal("expected exit manager to have exited after shutdown started")
+		case <-time.After(150 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited normally")
 		}
 
-		checkManagerExitCode(t, em, 1)
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("timeout mode forceful allows normal completion", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetTimeout(TimeoutModeForceful, 100*time.Millisecond)
+
+		// Fast cleanup
+		em.RegisterCleanup(func() {
+			time.Sleep(20 * time.Millisecond)
+		})
+
+		em.Shutdown()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(150 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited normally")
+		}
+
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("zero timeout duration disables timeout regardless of mode", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetTimeout(TimeoutModeForceful, 0) // Zero duration should disable timeout
+
+		// Acquire lock
+		_ = em.AcquireShutdownLock()
+		em.Shutdown()
+
+		// Should wait indefinitely despite forceful mode
+		select {
+		case <-em.exit.Done():
+			t.Fatal("expected exit manager to wait indefinitely with zero timeout")
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		// Release lock to allow cleanup
+		em.ReleaseShutdownLock()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited after locks released")
+		}
+
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("negative timeout duration disables timeout", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetTimeout(TimeoutModeForceful, -5*time.Second)
+
+		// Acquire lock
+		_ = em.AcquireShutdownLock()
+		em.Shutdown()
+
+		// Should wait indefinitely despite negative timeout
+		select {
+		case <-em.exit.Done():
+			t.Fatal("expected exit manager to wait indefinitely with negative timeout")
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		// Release lock to allow cleanup
+		em.ReleaseShutdownLock()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited after locks released")
+		}
+
+		checkExitCode(t, em, 0)
 	})
 }
 
@@ -297,7 +445,7 @@ func TestNotify(t *testing.T) {
 			t.Fatal("expected exit manager to have exited after shutdown started")
 		}
 
-		checkManagerExitCode(t, em, 0)
+		checkExitCode(t, em, 0)
 	})
 
 	t.Run("multiple Notify() listeners in parallel", func(t *testing.T) {
@@ -338,16 +486,16 @@ func TestNotify(t *testing.T) {
 			t.Fatal("expected exit manager to have exited after shutdown started")
 		}
 
-		checkManagerExitCode(t, em, 0)
+		checkExitCode(t, em, 0)
 	})
 }
 
-func TestWithCancel(t *testing.T) {
+func TestNotifyContext(t *testing.T) {
 	t.Parallel()
 
 	t.Run("context cancellation waits for notified shutdown", func(t *testing.T) {
 		em := testExitManager(t)
-		ctx, cancel := em.WithCancel(context.Background())
+		ctx, cancel := em.NotifyContext(context.Background())
 		t.Cleanup(cancel)
 
 		// Context should not be cancelled before shutdown
@@ -373,7 +521,7 @@ func TestWithCancel(t *testing.T) {
 			t.Fatal("expected exit manager to have exited after shutdown started")
 		}
 
-		checkManagerExitCode(t, em, 0)
+		checkExitCode(t, em, 0)
 	})
 
 	t.Run("context is returned cancelled on notified exit manager", func(t *testing.T) {
@@ -382,8 +530,8 @@ func TestWithCancel(t *testing.T) {
 		// Shutdown immediately exits
 		em.Shutdown()
 
-		// WithCancel should return a cancelled context
-		ctx, cancel := em.WithCancel(context.Background())
+		// NotifyContext should return a cancelled context
+		ctx, cancel := em.NotifyContext(context.Background())
 		t.Cleanup(cancel)
 		select {
 		case <-ctx.Done():
@@ -398,13 +546,13 @@ func TestWithCancel(t *testing.T) {
 			t.Fatal("expected exit manager to have exited after shutdown started")
 		}
 
-		checkManagerExitCode(t, em, 0)
+		checkExitCode(t, em, 0)
 	})
 
 	t.Run("mutliple contexts cancelled", func(t *testing.T) {
 		em := testExitManager(t)
-		ctx1, cancel1 := em.WithCancel(context.Background())
-		ctx2, cancel2 := em.WithCancel(context.Background())
+		ctx1, cancel1 := em.NotifyContext(context.Background())
+		ctx2, cancel2 := em.NotifyContext(context.Background())
 		t.Cleanup(cancel1)
 		t.Cleanup(cancel2)
 
@@ -440,6 +588,46 @@ func TestWithCancel(t *testing.T) {
 			t.Fatal("expected exit manager to have exited after shutdown started")
 		}
 
-		checkManagerExitCode(t, em, 0)
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("parent context cancellation", func(t *testing.T) {
+		em := testExitManager(t)
+
+		// Create a parent context that can be cancelled
+		parentCtx, parentCancel := context.WithCancel(context.Background())
+		defer parentCancel()
+
+		// Child context is registered with the exit manager
+		ctx, cancel := em.NotifyContext(parentCtx)
+		t.Cleanup(cancel)
+
+		// Child context is not cancelled initially
+		select {
+		case <-ctx.Done():
+			t.Fatal("context should not be cancelled initially")
+		case <-time.After(10 * time.Millisecond):
+		}
+
+		// Cancel parent context
+		parentCancel()
+
+		// Child context is cancelled on parent cancellation
+		select {
+		case <-ctx.Done():
+			if ctx.Err() != context.Canceled {
+				t.Fatalf("expected context.Canceled, got %v", ctx.Err())
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("context should be cancelled when parent context is cancelled")
+		}
+		// verify the exit manager is not shutdown from parent context cancellation
+		select {
+		case <-em.Notify():
+			t.Fatal("exit manager should not be shutdown from parent context cancellation")
+		case <-time.After(10 * time.Millisecond):
+		}
+
+		checkNoExit(t, em)
 	})
 }

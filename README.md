@@ -30,35 +30,49 @@ go run main.go
 ```
 
 **Quick Demo Scenario:**
-1. Run the script: `go run`.
-2. Type `l` (enter) a few times to acquire locks
-3. Type `s` (enter) to trigger shutdown - notice it waits for locks!
-4. Type `u` (enter) to release locks and watch cleanup execute
-5. Or try Ctrl+C to see real signal handling
+1. Run the script: `go run main.go`
+2. Try different timeout modes: `st 5s graceful` or `st 3s forceful`
+3. Type `l` (enter) a few times to acquire locks
+4. Type `s` (enter) to trigger shutdown - notice it waits for locks!
+5. Type `u` (enter) to release locks and watch cleanup execute
+6. Or try Ctrl+C to see real signal handling
 
-The CLI will provide a hands-on experience that will help you understand the concepts before reading the code examples below.
+The CLI will provide a hands-on experience that will help you understand the timeout modes and concepts before reading the code examples below.
 
 ## Testing
 
 Test with race condition detection:
 
 ```bash
-go test -race .
+go test -race ./...
 ```
 
 ## API
 
 ### Timeout Protection
 
-Prevent hanging during shutdown by setting a timeout:
+Prevent hanging during shutdown by setting a timeout with different modes:
 
 ```go
 em := exitmanager.Global()
-em.SetTimeout(30 * time.Second) // Force exit after 30 seconds
 
-// If cleanup takes too long, the process exits with code 1
-// If cleanup completes normally, the process exits with code 0
+// No timeout (default) - waits indefinitely
+em.SetTimeout(exitmanager.TimeoutModeNone, 30*time.Second)
+
+// Graceful timeout - applies only to cleanup functions
+em.SetTimeout(exitmanager.TimeoutModeGraceful, 30*time.Second)
+
+// Forceful timeout - applies to entire shutdown process
+em.SetTimeout(exitmanager.TimeoutModeForceful, 30*time.Second)
+
+// If timeout expires, the process exits with code 1
+// If shutdown completes normally, the process exits with code 0
 ```
+
+**Timeout Modes:**
+- **`TimeoutModeNone`**: No timeout enforced will wait indefinitely to complete shutdown
+- **`TimeoutModeGraceful`**: Timeout applies only to cleanup function execution. Good for most applications
+- **`TimeoutModeForceful`**: Timeout applies to the entire shutdown process. Force exit will occur even if locks are still held
 
 ### Programmatic Shutdown
 
@@ -269,7 +283,7 @@ func main() {
     em := exitmanager.Global()
 
     // Register a context that is cancelled on shutdown
-    ctx, cancel := em.WithCancel(context.Background())
+    ctx, cancel := em.NotifyContext(context.Background())
     defer cancel()
 
     // Waits for long-running task
@@ -320,7 +334,7 @@ import (
 
 func main() {
     em := exitmanager.Global()
-    em.SetTimeout(10 * time.Second)
+    em.SetTimeout(exitmanager.TimeoutModeForceful, 10*time.Second)
     
     // Waits for background worker on exit
     em.RegisterCleanup(func() {
