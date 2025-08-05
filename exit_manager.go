@@ -73,6 +73,7 @@ type ExitManager struct {
 	notifyCh        chan struct{}
 	shutdown        chan struct{}
 	cleanups        []func()
+	contextCancels  []context.CancelFunc
 	flush           func()
 	httpExitManager httpExitManager
 	exit            exitHandler
@@ -156,13 +157,12 @@ const (
 	TimeoutModeForceful                    // Timeout is applied to the entire shutdown process
 )
 
-// SetTimeout configures the maximum shutdown duration before forced exit.
+// SetTimeout configures the shutdown timeout behavior based on the specified mode.
 //
-// If timeout is set to zero or less, the exit manager waits indefinitely for graceful shutdown.
-// If timeout expires, exits with code 1 and can interrupt cleanup.
-// The timeout covers the entire shutdown process:
-//   - Waiting for shutdown locks to be released
-//   - Executing cleanup functions
+// The mode parameter determines how the timeout is applied:
+//   - TimeoutModeNone: No timeout is applied (waits indefinitely)
+//   - TimeoutModeGraceful: Timeout only applies to cleanup function execution
+//   - TimeoutModeForceful: Timeout applies to the entire shutdown process
 //
 // Consider the time required for cleanup functions to ensure successful shutdown.
 func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
@@ -206,32 +206,6 @@ func (em *ExitManager) Locks() int {
 	defer em.mu.RUnlock()
 	return em.locks
 }
-
-// AcquireShutdownLock prevents shutdown until the lock is released.
-//
-// Returns an error if shutdown has already been initiated, allowing
-// the caller to abort the operation gracefully. Each successful call
-// must be paired with exactly one call to ReleaseShutdownLock().
-// Multiple locks can be acquired; shutdown waits for all to be released.
-//
-// Example:
-//
-//	if err := em.AcquireShutdownLock(); err != nil {
-//		return err // Shutdown in progress
-//	}
-//	defer em.ReleaseShutdownLock()
-//	// Perform critical operation...
-// func (em *ExitManager) AcquireShutdownLock() error {
-// 	em.mu.Lock()
-// 	if em.notified {
-// 		em.mu.Unlock()
-// 		return errors.New("exit manager: shutdown in progress")
-// 	} else {
-// 		em.locks++
-// 		em.mu.Unlock()
-// 		return nil
-// 	}
-// }
 
 var ErrShutdownInProgress = errors.New("exit manager: shutdown in progress")
 
@@ -392,39 +366,16 @@ func (em *ExitManager) RegisterCleanup(f func()) {
 func (em *ExitManager) NotifyContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
 
-	em.mu.RLock()
+	em.mu.Lock()
 	if em.notified {
-		em.mu.RUnlock()
+		em.mu.Unlock()
 		cancel()
 		return ctx, cancel
 	}
-	em.mu.RUnlock()
 
-	done := make(chan struct{})
-	once := sync.Once{}
-	cleanup := func() {
-		once.Do(func() {
-			close(done)
-			cancel()
-		})
-	}
+	em.contextCancels = append(em.contextCancels, cancel)
+	em.mu.Unlock()
 
-	go func() {
-		select {
-		case <-done:
-		case <-ctx.Done():
-			cleanup()
-		case <-em.Notify():
-			cleanup()
-		}
-	}()
-
-	return ctx, cleanup
-}
-
-// WithCancel provides the same functionality as [ExitManager.NotifyContext].
-func (em *ExitManager) WithCancel(ctx context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := em.NotifyContext(ctx)
 	return ctx, cancel
 }
 
@@ -486,110 +437,116 @@ func (em *ExitManager) listenForSignals() {
 		shutdownSource = "programmatic"
 	}
 
-	em.once.Do(func() {
-		em.mu.Lock()
-		em.notified = true
-		cleanups := append([]func(){}, em.cleanups...)
-		httpEM := em.httpExitManager
-		logger := em.logger
-		logger.Info("shutdown initiated", "source", shutdownSource, "cleanup_functions", len(cleanups))
-		close(em.notifyCh)
-		em.mu.Unlock()
+	em.mu.Lock()
+	em.notified = true
+	cleanups := append([]func(){}, em.cleanups...)
+	contextCancels := append([]context.CancelFunc{}, em.contextCancels...)
+	httpEM := em.httpExitManager
+	logger := em.logger
+	flush := em.flush
+	close(em.notifyCh)
+	em.mu.Unlock()
 
-		done := make(chan struct{})
-		startedCleanup := make(chan struct{})
-		go func() {
-			if httpEM != nil {
-				logger.Debug("waiting for http exit manager shutdown")
-				<-httpEM.Done()
-				logger.Debug("http exit manager shutdown completed")
-			}
+	logger.Info("shutdown initiated",
+		"source", shutdownSource,
+		"cleanup_functions", len(cleanups),
+		"context_cancels", len(contextCancels),
+	)
 
-			em.mu.RLock()
-			locks := em.locks
-			em.mu.RUnlock()
+	// flushLogger flushes the logger if a flush function is provided.
+	// This is useful for third party loggers that need to be flushed
+	// to ensure all logs are written to the underlying writer.
+	flushLogger := func(logger *slog.Logger, flush func()) {
+		if flush != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// This likely won't be received if flush is required.
+						// There's not much we can do about it since we're about to exit.
+						logger.Error("flush logger panicked", "panic", r)
+					}
+				}()
+				flush()
+			}()
+		}
+	}
 
-			if locks > 0 {
-				logger.Debug("waiting for shutdown locks to be released", "locks", locks)
-				<-em.locksCh
-			}
+	done := make(chan struct{})
+	startedCleanup := make(chan struct{})
+	go func() {
 
-			close(startedCleanup)
-			if len(cleanups) > 0 {
-				logger.Debug("executing cleanup functions", "count", len(cleanups))
-				for i := len(cleanups) - 1; i >= 0; i-- {
-					func() {
-						defer func() {
-							if r := recover(); r != nil {
-								// Log the panic but continue with remaining cleanup functions
-								// This ensures one panicking cleanup doesn't prevent others from running
-								// Users should handle their own errors, but we provide graceful degradation
-								logger.Error("cleanup function panicked", "panic", r)
-							}
-						}()
-						cleanups[i]()
+		for _, cancel := range contextCancels {
+			cancel()
+		}
+
+		if httpEM != nil {
+			logger.Info("waiting for http exit manager shutdown")
+			<-httpEM.Done()
+			logger.Info("http exit manager shutdown completed")
+		}
+
+		em.mu.RLock()
+		locks := em.locks
+		em.mu.RUnlock()
+
+		if locks > 0 {
+			logger.Info("waiting for shutdown locks to be released", "locks", locks)
+			<-em.locksCh
+		}
+
+		close(startedCleanup)
+		if len(cleanups) > 0 {
+			logger.Debug("executing cleanup functions", "count", len(cleanups))
+			for i := len(cleanups) - 1; i >= 0; i-- {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							logger.Error("cleanup function panicked", "panic", r)
+						}
 					}()
-				}
-				logger.Debug("cleanup functions completed")
+					cleanups[i]()
+				}()
 			}
-
-			close(done)
-		}()
-
-		// no timeout set
-		if em.timeoutMode == TimeoutModeNone || em.timeout <= 0 {
-			<-done
-			logger.Info("graceful shutdown completed")
-			em.flushLogger()
-			em.exit.Exit(0)
-			return
+			logger.Info("cleanup functions completed")
 		}
 
-		// timeout mode is graceful
-		if em.timeoutMode == TimeoutModeGraceful {
-			<-startedCleanup
-			select {
-			case <-done:
-				logger.Info("graceful shutdown completed")
-				em.flushLogger()
-				em.exit.Exit(0)
-			case <-time.After(em.timeout):
-				logger.Warn("graceful shutdown timeout expired", "timeout", em.timeout)
-				em.flushLogger()
-				em.exit.Exit(1)
-			}
-			return
-		}
+		close(done)
+	}()
 
-		// timeout mode is forceful
+	// no timeout set
+	if em.timeoutMode == TimeoutModeNone || em.timeout <= 0 {
+		<-done
+		logger.Info("graceful shutdown completed")
+		flushLogger(logger, flush)
+		em.exit.Exit(0)
+		return
+	}
+
+	// timeout mode is graceful
+	if em.timeoutMode == TimeoutModeGraceful {
+		<-startedCleanup
 		select {
 		case <-done:
 			logger.Info("graceful shutdown completed")
-			em.flushLogger()
+			flushLogger(logger, flush)
 			em.exit.Exit(0)
 		case <-time.After(em.timeout):
-			logger.Warn("forceful shutdown timeout expired", "timeout", em.timeout)
-			em.flushLogger()
+			logger.Error("graceful shutdown timeout expired", "timeout", em.timeout)
+			flushLogger(logger, flush)
 			em.exit.Exit(1)
 		}
-	})
-}
-
-// flushLogger flushes the logger if a flush function is provided.
-// This is useful for third party loggers that need to be flushed
-// to ensure all logs are written to the underlying writer.
-func (em *ExitManager) flushLogger() {
-	em.mu.RLock()
-	flush := em.flush
-	if flush != nil {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					em.logger.Error("flush logger panicked", "panic", r)
-				}
-			}()
-			flush()
-		}()
+		return
 	}
-	em.mu.RUnlock()
+
+	// timeout mode is forceful
+	select {
+	case <-done:
+		logger.Info("graceful shutdown completed")
+		flushLogger(logger, flush)
+		em.exit.Exit(0)
+	case <-time.After(em.timeout):
+		logger.Error("forceful shutdown timeout expired", "timeout", em.timeout)
+		flushLogger(logger, flush)
+		em.exit.Exit(1)
+	}
 }
