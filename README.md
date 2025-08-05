@@ -103,6 +103,20 @@ if locks := em.Locks(); locks > 0 {
 }
 ```
 
+# Logging
+
+Both exit managers support structured logging using Go's `log/slog` package. The logging integration provides visibility into shutdown process stages, lock operations, and HTTP server management.
+
+```go
+em := exitmanager.Global()
+em.SetLogger(slog.Default())
+
+// The shutdown process will now be communicated via default slog.Logger.
+// You may need to register a flush write cleanup depending on your logger adapter for third party loggers.
+// 
+```
+
+
 ## Basic Usage
 
 ### Shutdown Routinues

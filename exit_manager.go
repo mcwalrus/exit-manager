@@ -48,6 +48,8 @@ package exitmanager
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
@@ -64,12 +66,14 @@ type ExitManager struct {
 	locks           int
 	notified        bool
 	once            *sync.Once
+	logger          *slog.Logger
 	timeout         time.Duration
 	timeoutMode     TimeoutMode
 	locksCh         chan struct{}
 	notifyCh        chan struct{}
 	shutdown        chan struct{}
 	cleanups        []func()
+	flush           func()
 	httpExitManager httpExitManager
 	exit            exitHandler
 }
@@ -88,7 +92,13 @@ func newExitManager() *ExitManager {
 		notifyCh: make(chan struct{}),
 		shutdown: make(chan struct{}),
 		exit:     osExitHandler{},
+		logger:   noopLogger(),
 	}
+}
+
+// noopLogger returns a no-op logger that discards all output.
+func noopLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // exitHandler provides an interface for process termination.
@@ -162,6 +172,26 @@ func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
 	em.mu.Unlock()
 }
 
+// SetLogger configures the structured logger for the exit manager.
+// The logger will be used to log shutdown process stages, lock operations,
+// and HTTP server registration events with the subsystem "exit-manager".
+// If logger is nil, a no-op logger will be used.
+//
+// If flush is provided, it will be called when the shutdown process
+// completes. This is useful for third party loggers that need to be
+// flushed to ensure all logs are written to the underlying writer.
+// If flush is nil, no operation to flush will be performed.
+func (em *ExitManager) SetLogger(logger *slog.Logger, flush func()) {
+	em.mu.Lock()
+	if logger != nil {
+		em.logger = logger.With("subsystem", "exit-manager")
+	} else {
+		em.logger = noopLogger()
+	}
+	em.flush = flush
+	em.mu.Unlock()
+}
+
 // Locks returns the current number of active shutdown locks.
 // Useful for monitoring shutdown progress. A non-zero value indicates
 // critical operations are still preventing shutdown completion.
@@ -226,6 +256,7 @@ func (em *ExitManager) AcquireShutdownLock() error {
 		return ErrShutdownInProgress
 	} else {
 		em.locks++
+		em.logger.Debug("shutdown lock acquired", "locks", em.locks)
 		em.mu.Unlock()
 		return nil
 	}
@@ -265,8 +296,10 @@ func (em *ExitManager) ReleaseShutdownLock() {
 	em.mu.Lock()
 	if em.locks > 0 {
 		em.locks--
+		em.logger.Debug("shutdown lock released", "locks", em.locks)
 	}
 	if em.locks == 0 && em.notified {
+		em.logger.Debug("all shutdown locks released")
 		select {
 		case <-em.locksCh:
 		default:
@@ -428,6 +461,8 @@ func (em *ExitManager) RegisterHTTPExitManager() *httpexit.HTTPExitManager {
 
 	em.mu.Lock()
 	em.httpExitManager = httpEM
+	em.logger.Info("http exit manager registered")
+	httpEM.SetLogger(em.logger)
 	em.mu.Unlock()
 
 	go func() {
@@ -443,9 +478,12 @@ func (em *ExitManager) listenForSignals() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	var shutdownSource string
 	select {
 	case <-sigCh:
+		shutdownSource = "signal"
 	case <-em.shutdown:
+		shutdownSource = "programmatic"
 	}
 
 	em.once.Do(func() {
@@ -453,38 +491,56 @@ func (em *ExitManager) listenForSignals() {
 		em.notified = true
 		cleanups := append([]func(){}, em.cleanups...)
 		httpEM := em.httpExitManager
+		logger := em.logger
+		logger.Info("shutdown initiated", "source", shutdownSource, "cleanup_functions", len(cleanups))
 		close(em.notifyCh)
-		locks := em.locks
 		em.mu.Unlock()
 
 		done := make(chan struct{})
 		startedCleanup := make(chan struct{})
 		go func() {
 			if httpEM != nil {
+				logger.Debug("waiting for http exit manager shutdown")
 				<-httpEM.Done()
+				logger.Debug("http exit manager shutdown completed")
 			}
+
+			em.mu.RLock()
+			locks := em.locks
+			em.mu.RUnlock()
+
 			if locks > 0 {
+				logger.Debug("waiting for shutdown locks to be released", "locks", locks)
 				<-em.locksCh
 			}
+
 			close(startedCleanup)
-			for i := len(cleanups) - 1; i >= 0; i-- {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							// Log the panic but continue with remaining cleanup functions
-							// This ensures one panicking cleanup doesn't prevent others from running
-							// Users should handle their own errors, but we provide graceful degradation
-						}
+			if len(cleanups) > 0 {
+				logger.Debug("executing cleanup functions", "count", len(cleanups))
+				for i := len(cleanups) - 1; i >= 0; i-- {
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								// Log the panic but continue with remaining cleanup functions
+								// This ensures one panicking cleanup doesn't prevent others from running
+								// Users should handle their own errors, but we provide graceful degradation
+								logger.Error("cleanup function panicked", "panic", r)
+							}
+						}()
+						cleanups[i]()
 					}()
-					cleanups[i]()
-				}()
+				}
+				logger.Debug("cleanup functions completed")
 			}
+
 			close(done)
 		}()
 
 		// no timeout set
 		if em.timeoutMode == TimeoutModeNone || em.timeout <= 0 {
 			<-done
+			logger.Info("graceful shutdown completed")
+			em.flushLogger()
 			em.exit.Exit(0)
 			return
 		}
@@ -494,8 +550,12 @@ func (em *ExitManager) listenForSignals() {
 			<-startedCleanup
 			select {
 			case <-done:
+				logger.Info("graceful shutdown completed")
+				em.flushLogger()
 				em.exit.Exit(0)
 			case <-time.After(em.timeout):
+				logger.Warn("graceful shutdown timeout expired", "timeout", em.timeout)
+				em.flushLogger()
 				em.exit.Exit(1)
 			}
 			return
@@ -504,9 +564,32 @@ func (em *ExitManager) listenForSignals() {
 		// timeout mode is forceful
 		select {
 		case <-done:
+			logger.Info("graceful shutdown completed")
+			em.flushLogger()
 			em.exit.Exit(0)
 		case <-time.After(em.timeout):
+			logger.Warn("forceful shutdown timeout expired", "timeout", em.timeout)
+			em.flushLogger()
 			em.exit.Exit(1)
 		}
 	})
+}
+
+// flushLogger flushes the logger if a flush function is provided.
+// This is useful for third party loggers that need to be flushed
+// to ensure all logs are written to the underlying writer.
+func (em *ExitManager) flushLogger() {
+	em.mu.RLock()
+	flush := em.flush
+	if flush != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					em.logger.Error("flush logger panicked", "panic", r)
+				}
+			}()
+			flush()
+		}()
+	}
+	em.mu.RUnlock()
 }

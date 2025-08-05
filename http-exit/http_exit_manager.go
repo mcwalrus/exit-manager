@@ -51,6 +51,8 @@ package httpexit
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -75,6 +77,7 @@ type HTTPExitManager struct {
 	notify        chan struct{}
 	shutdown      chan struct{}
 	done          chan struct{}
+	logger        *slog.Logger
 }
 
 // HTTPServerShutdownConfig provides control over HTTP server shutdown behavior.
@@ -117,7 +120,13 @@ func newHTTPExitManager() *HTTPExitManager {
 		notify:   make(chan struct{}),
 		shutdown: make(chan struct{}),
 		done:     make(chan struct{}),
+		logger:   noopLogger(),
 	}
+}
+
+// noopLogger returns a no-op logger that discards all output.
+func noopLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // Global returns the singleton HTTP exit manager instance.
@@ -140,6 +149,20 @@ func Global() *HTTPExitManager {
 		manager = em
 	})
 	return manager
+}
+
+// SetLogger configures the structured logger for the HTTP exit manager.
+// The logger will be used to log HTTP server registration, pre-shutdown hooks,
+// and server shutdown events with the subsystem "exit-manager".
+// If logger is nil, a no-op logger will be used.
+func (em *HTTPExitManager) SetLogger(logger *slog.Logger) {
+	em.mu.Lock()
+	if logger != nil {
+		em.logger = logger.With("component", "http")
+	} else {
+		em.logger = noopLogger()
+	}
+	em.mu.Unlock()
 }
 
 // RegisterPreShutdown registers a function to execute before HTTP server shutdowns begin.
@@ -215,9 +238,18 @@ func (em *HTTPExitManager) RegisterHTTPServer(cfg HTTPServerShutdownConfig) erro
 		return fmt.Errorf("httpexit.ExitManager: cannot register nil http.Server")
 	}
 
+	serverAddr := cfg.Server.Addr
+	if serverAddr == "" {
+		serverAddr = ":http"
+	}
+
+	em.logger.Info("http server registered", "addr", serverAddr, "timeout", cfg.Timeout)
+
 	em.httpShutdowns = append(
 		em.httpShutdowns,
 		func() {
+			em.logger.Debug("shutting down http server", "addr", serverAddr)
+
 			handleErr := cfg.HandleErr
 			ctx := cfg.Ctx
 			if ctx == nil {
@@ -229,8 +261,13 @@ func (em *HTTPExitManager) RegisterHTTPServer(cfg HTTPServerShutdownConfig) erro
 				defer cancel()
 			}
 			err := cfg.Server.Shutdown(ctx)
-			if handleErr != nil && err != nil {
-				handleErr(err)
+			if err != nil {
+				em.logger.Error("http server shutdown error", "addr", serverAddr, "error", err)
+				if handleErr != nil {
+					handleErr(err)
+				}
+			} else {
+				em.logger.Debug("http server shutdown completed", "addr", serverAddr)
 			}
 		},
 	)
@@ -302,47 +339,56 @@ func (em *HTTPExitManager) listenForSignals() {
 		em.notified = true
 		preShutdowns := append([]func(){}, em.preShutdowns...)
 		httpShutdowns := append([]func(){}, em.httpShutdowns...)
+		logger := em.logger
 		close(em.notify)
 		em.mu.Unlock()
 
 		defer func() {
+			logger.Info("http shutdown completed")
 			close(em.done)
 		}()
 
+		logger.Info("http shutdown initiated", "pre_shutdown_hooks", len(preShutdowns), "http_servers", len(httpShutdowns))
 		if len(preShutdowns) == 0 && len(httpShutdowns) == 0 {
 			return
 		}
 
 		// Execute pre-shutdown functions in reverse order (LIFO)
-		for i := len(preShutdowns) - 1; i >= 0; i-- {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						// Log the panic but continue with remaining pre-shutdown functions
-						// This ensures one panicking pre-shutdown doesn't prevent others from running
-						// Users should handle their own errors, but we provide graceful degradation
-					}
+		if len(preShutdowns) > 0 {
+			logger.Debug("executing pre-shutdown hooks", "count", len(preShutdowns))
+			for i := len(preShutdowns) - 1; i >= 0; i-- {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							logger.Error("pre-shutdown hook panicked", "panic", r)
+						}
+					}()
+					preShutdowns[i]()
 				}()
-				preShutdowns[i]()
-			}()
+			}
+			logger.Debug("pre-shutdown hooks completed")
 		}
 
 		// Shutdown all HTTP servers concurrently
-		wg := &sync.WaitGroup{}
-		wg.Add(len(httpShutdowns))
-		for _, shutdown := range httpShutdowns {
-			go func(f func()) {
-				defer wg.Done()
-				defer func() {
-					if r := recover(); r != nil {
-						// Log the panic but continue with remaining server shutdowns
-						// This ensures one panicking server shutdown doesn't prevent others from running
-						// Users should handle their own errors, but we provide graceful degradation
-					}
-				}()
-				f()
-			}(shutdown)
+		if len(httpShutdowns) > 0 {
+			logger.Debug("shutting down http servers", "count", len(httpShutdowns))
+			wg := &sync.WaitGroup{}
+			wg.Add(len(httpShutdowns))
+			for _, shutdown := range httpShutdowns {
+				go func(f func()) {
+					defer wg.Done()
+					defer func() {
+						if r := recover(); r != nil {
+							logger.Error("http server shutdown panicked", "panic", r)
+						}
+					}()
+					f()
+				}(shutdown)
+			}
+			wg.Wait()
+			logger.Debug("all http servers shutdown completed")
+		} else {
+			logger.Debug("no http servers registered to shutdown")
 		}
-		wg.Wait()
 	})
 }
