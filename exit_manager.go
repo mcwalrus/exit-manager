@@ -48,8 +48,10 @@ package exitmanager
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -66,11 +68,14 @@ type ExitManager struct {
 	logger         *slog.Logger
 	timeout        time.Duration
 	timeoutMode    TimeoutMode
+	serverTimeout  time.Duration
 	locksCh        chan struct{}
 	notifyCh       chan struct{}
 	shutdown       chan struct{}
 	cleanups       []func()
 	contextCancels []context.CancelFunc
+	preShutdowns   []func()
+	servers        []*http.Server
 	flush          func()
 	exit           exitHandler
 }
@@ -157,6 +162,19 @@ func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
 	em.mu.Lock()
 	em.timeoutMode = mode
 	em.timeout = timeout
+	em.mu.Unlock()
+}
+
+// SetServerTimeout configures the timeout for HTTP server shutdown operations.
+// This timeout is applied to each individual server's shutdown process.
+// If timeout is 0 or negative, servers will shutdown without a timeout.
+//
+// Example:
+//
+//	em.SetServerTimeout(30 * time.Second)
+func (em *ExitManager) SetServerTimeout(timeout time.Duration) {
+	em.mu.Lock()
+	em.serverTimeout = timeout
 	em.mu.Unlock()
 }
 
@@ -306,6 +324,71 @@ func (em *ExitManager) Shutdown() {
 	em.mu.Unlock()
 }
 
+// RegisterPreShutdown registers a function to execute before the shutdown process
+// begins after the exit manager is first notified of shutdown.
+//
+// These functions execute in reverse registration order (LIFO). All pre-shutdown hooks
+// will complete before any HTTP servers begin their shutdown process. If the exit manager
+// is already notified of shutdown, registration is ignored.
+//
+// Example:
+//
+//	em.RegisterPreShutdown(func() {
+//		log.Println("Closing hijacked http connections...")
+//		for _, conn := range httpConns {
+//			conn.Close()
+//		}
+//	})
+func (em *ExitManager) RegisterPreShutdown(f func()) {
+	em.mu.Lock()
+	if !em.notified {
+		em.preShutdowns = append(em.preShutdowns, f)
+	}
+	em.mu.Unlock()
+}
+
+// RegisterServer registers an HTTP server for graceful shutdown coordination.
+//
+// The server will be shutdown gracefully when the exit manager is notified.
+// All registered servers are shutdown concurrently for faster overall shutdown.
+// Use [ExitManager.SetServerTimeout] to configure the shutdown timeout for all servers.
+//
+// Returns an error if:
+//   - The exit manager has already been notified of shutdown
+//   - The provided server is nil
+//
+// Note, server shutdown errors are logged but don't prevent the exit manager from
+// continuing with the shutdown sequence.
+//
+// Example:
+//
+//	em.SetServerTimeout(30 * time.Second)
+//	err := em.RegisterServer(server)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+func (em *ExitManager) RegisterServer(server *http.Server) error {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+
+	if em.notified {
+		return fmt.Errorf("exit manager: notified of shutdown")
+	}
+	if server == nil {
+		return fmt.Errorf("exit manager: cannot register nil http.Server")
+	}
+
+	serverAddr := server.Addr
+	if serverAddr == "" {
+		serverAddr = ":http"
+	}
+
+	em.logger.Info("http server registered", "addr", serverAddr)
+	em.servers = append(em.servers, server)
+
+	return nil
+}
+
 // RegisterCleanup registers a function to execute during shutdown.
 //
 // Cleanup functions execute in LIFO order after all shutdown locks
@@ -363,51 +446,6 @@ func (em *ExitManager) NotifyContext(ctx context.Context) (context.Context, cont
 	return ctx, cancel
 }
 
-// httpExitManager defines the interface for HTTP server shutdown coordination.
-// This allows the base exit manager to coordinate with HTTP-specific shutdown logic
-// without creating a direct dependency on the HTTP exit manager package.
-type httpExitManager interface {
-	Shutdown()
-	Done() <-chan struct{}
-}
-
-// RegisterHTTPExitManager registers and returns the HTTP exit manager for [net/http.Server]
-// shutdown coordination.
-//
-// This integrates with [net/http.Server.Shutdown] shutdown coordination with the base exit manager,
-// ensuring that HTTP servers are gracefully shutdown first, before checking locks
-// and executing other cleanup functions. This is a global instance and can be accessed
-// safely across concurrent goroutines.
-//
-// Example:
-//
-//	// Register and configure HTTP exit manager
-//	em := exitmanager.Global()
-//	httpEM := em.RegisterHTTPExitManager()
-//	httpEM.RegisterHTTPServer(httpexit.HTTPServerShutdownConfig{
-//		Server: server,
-//		Timeout: 30 * time.Second,
-//	})
-//
-//	// Wait for shutdown
-//	<-em.Notify()
-func (em *ExitManager) RegisterHTTPExitManager() *httpexit.HTTPExitManager {
-	httpEM := httpexit.Global()
-
-	em.mu.Lock()
-	em.httpExitManager = httpEM
-	em.logger.Info("http exit manager registered")
-	httpEM.SetLogger(em.logger)
-	em.mu.Unlock()
-
-	go func() {
-		<-httpEM.Notify()
-		em.Shutdown()
-	}()
-
-	return httpEM
-}
-
 // listenForSignals handles signal registration and coordinates the shutdown process.
 func (em *ExitManager) listenForSignals() {
 	sigCh := make(chan os.Signal, 1)
@@ -425,7 +463,9 @@ func (em *ExitManager) listenForSignals() {
 	em.notified = true
 	cleanups := append([]func(){}, em.cleanups...)
 	contextCancels := append([]context.CancelFunc{}, em.contextCancels...)
-	httpEM := em.httpExitManager
+	preShutdowns := append([]func(){}, em.preShutdowns...)
+	servers := append([]*http.Server{}, em.servers...)
+	serverTimeout := em.serverTimeout
 	logger := em.logger
 	flush := em.flush
 	close(em.notifyCh)
@@ -435,6 +475,8 @@ func (em *ExitManager) listenForSignals() {
 		"source", shutdownSource,
 		"cleanup_functions", len(cleanups),
 		"context_cancels", len(contextCancels),
+		"pre_shutdown_hooks", len(preShutdowns),
+		"http_servers", len(servers),
 	)
 
 	// flushLogger flushes the logger if a flush function is provided.
@@ -456,7 +498,12 @@ func (em *ExitManager) listenForSignals() {
 	done := make(chan struct{})
 	startedCleanup := make(chan struct{})
 	go func() {
+		defer func() {
+			logger.Info("shutdown completed")
+			close(done)
+		}()
 
+		// Cancel all registered contexts first
 		if len(contextCancels) > 0 {
 			logger.Info("cancelling context cancels", "count", len(contextCancels))
 			for _, cancel := range contextCancels {
@@ -464,6 +511,61 @@ func (em *ExitManager) listenForSignals() {
 			}
 		}
 
+		// Execute pre-shutdown functions in reverse order (LIFO)
+		if len(preShutdowns) > 0 {
+			logger.Debug("executing pre-shutdown hooks", "count", len(preShutdowns))
+			for i := len(preShutdowns) - 1; i >= 0; i-- {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							logger.Error("pre-shutdown hook panicked", "panic", r)
+						}
+					}()
+					preShutdowns[i]()
+				}()
+			}
+			logger.Debug("pre-shutdown hooks completed")
+		}
+
+		// Shutdown all HTTP servers concurrently
+		if len(servers) > 0 {
+			logger.Debug("shutting down http servers", "count", len(servers))
+
+			ctx := context.Background()
+			var cancel context.CancelFunc
+			func() {
+				if serverTimeout > 0 {
+					ctx, cancel = context.WithTimeout(ctx, serverTimeout)
+					defer cancel()
+				}
+
+				wg := &sync.WaitGroup{}
+				wg.Add(len(servers))
+				for _, server := range servers {
+					go func(srv *http.Server) {
+						defer wg.Done()
+
+						serverAddr := srv.Addr
+						if serverAddr == "" {
+							serverAddr = ":http"
+						}
+
+						logger.Debug("shutting down http server", "addr", serverAddr)
+
+						err := srv.Shutdown(ctx)
+						if err != nil {
+							logger.Error("http server shutdown error", "addr", serverAddr, "error", err)
+						} else {
+							logger.Debug("http server shutdown completed", "addr", serverAddr)
+						}
+					}(server)
+				}
+				wg.Wait()
+				logger.Debug("all http servers shutdown completed")
+			}()
+		}
+
+		// Wait for shutdown locks to be released
 		em.mu.RLock()
 		locks := em.locks
 		em.mu.RUnlock()
@@ -474,6 +576,8 @@ func (em *ExitManager) listenForSignals() {
 		}
 
 		close(startedCleanup)
+
+		// Execute cleanup functions in reverse order (LIFO)
 		if len(cleanups) > 0 {
 			logger.Info("executing cleanup functions", "count", len(cleanups))
 			for i := len(cleanups) - 1; i >= 0; i-- {
@@ -488,8 +592,6 @@ func (em *ExitManager) listenForSignals() {
 			}
 			logger.Info("cleanup functions completed")
 		}
-
-		close(done)
 	}()
 
 	// no timeout set

@@ -11,6 +11,7 @@ A Go library that provides **graceful shutdown coordination** for applications, 
 3. **🔒 Lock Coordination**: Waits for all shutdown locks to be released
 4. **🧹 Cleanup Execution**: Runs cleanup functions in reverse registration order  
 5. **🚪 Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
+6. **🌐 HTTP Server Support**: Graceful shutdown coordination for HTTP servers
 
 ## Installation
 
