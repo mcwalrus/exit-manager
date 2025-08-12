@@ -60,7 +60,7 @@ import (
 )
 
 // ExitManager coordinates graceful application shutdowns.
-// Use Global() to get the singleton instance.
+// Use [Global] to get the singleton instance.
 type ExitManager struct {
 	mu             *sync.RWMutex
 	locks          int
@@ -109,6 +109,7 @@ type exitHandler interface {
 	Done() <-chan struct{}
 }
 
+// osExitHandler implements os.Exit as the default handler.
 type osExitHandler struct{}
 
 func (ehi osExitHandler) Exit(code int) {
@@ -158,6 +159,12 @@ const (
 )
 
 // SetTimeout configures the shutdown timeout behavior based on the specified mode.
+// If timeout is 0 or negative, the timeout is disabled. The timeout is applied
+// to the entire shutdown process.
+//
+// Example:
+//
+//	em.SetTimeout(exitmanager.TimeoutModeGraceful, 30*time.Second)
 func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
 	em.mu.Lock()
 	em.timeoutMode = mode
@@ -166,7 +173,7 @@ func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
 }
 
 // SetServerTimeout configures the timeout for HTTP server shutdown operations.
-// This timeout is applied to each individual server's shutdown process.
+// This timeout is applied to all registered servers and pre-shutdown hooks.
 // If timeout is 0 or negative, servers will shutdown without a timeout.
 //
 // Example:
@@ -324,12 +331,13 @@ func (em *ExitManager) Shutdown() {
 	em.mu.Unlock()
 }
 
-// RegisterPreShutdown registers a function to execute before the shutdown process
-// begins after the exit manager is first notified of shutdown.
+// RegisterPreShutdown registers a function to execute before the shutdown
+// process begins after the exit manager is first notified of shutdown.
 //
-// These functions execute in reverse registration order (LIFO). All pre-shutdown hooks
-// will complete before any HTTP servers begin their shutdown process. If the exit manager
-// is already notified of shutdown, registration is ignored.
+// These functions (or hooks) execute in reverse registration order (LIFO).
+// All pre-shutdown hooks will complete before any HTTP servers begin their
+// shutdown process. If the exit manager is already notified of shutdown,
+// registration is ignored.
 //
 // Example:
 //
@@ -511,33 +519,34 @@ func (em *ExitManager) listenForSignals() {
 			}
 		}
 
-		// Execute pre-shutdown functions in reverse order (LIFO)
-		if len(preShutdowns) > 0 {
-			logger.Debug("executing pre-shutdown hooks", "count", len(preShutdowns))
-			for i := len(preShutdowns) - 1; i >= 0; i-- {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							logger.Error("pre-shutdown hook panicked", "panic", r)
-						}
-					}()
-					preShutdowns[i]()
-				}()
+		// Apply timeout to pre-shutdown hooks and http servers shutdowns
+		ctx := context.Background()
+		var cancel context.CancelFunc
+		func() {
+			if serverTimeout > 0 {
+				ctx, cancel = context.WithTimeout(ctx, serverTimeout)
+				defer cancel()
 			}
-			logger.Debug("pre-shutdown hooks completed")
-		}
 
-		// Shutdown all HTTP servers concurrently
-		if len(servers) > 0 {
-			logger.Debug("shutting down http servers", "count", len(servers))
-
-			ctx := context.Background()
-			var cancel context.CancelFunc
-			func() {
-				if serverTimeout > 0 {
-					ctx, cancel = context.WithTimeout(ctx, serverTimeout)
-					defer cancel()
+			// Execute pre-shutdown functions in reverse order (LIFO)
+			if len(preShutdowns) > 0 {
+				logger.Debug("executing pre-shutdown hooks", "count", len(preShutdowns))
+				for i := len(preShutdowns) - 1; i >= 0; i-- {
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								logger.Error("pre-shutdown hook panicked", "panic", r)
+							}
+						}()
+						preShutdowns[i]()
+					}()
 				}
+				logger.Debug("pre-shutdown hooks completed")
+			}
+
+			// Shutdown all HTTP servers concurrently
+			if len(servers) > 0 {
+				logger.Debug("shutting down http servers", "count", len(servers))
 
 				wg := &sync.WaitGroup{}
 				wg.Add(len(servers))
@@ -562,8 +571,8 @@ func (em *ExitManager) listenForSignals() {
 				}
 				wg.Wait()
 				logger.Debug("all http servers shutdown completed")
-			}()
-		}
+			}
+		}()
 
 		// Wait for shutdown locks to be released
 		em.mu.RLock()
