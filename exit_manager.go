@@ -55,28 +55,24 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	httpexit "github.com/mcwalrus/exit-manager/http-exit"
 )
 
 // ExitManager coordinates graceful application shutdowns.
 // Use Global() to get the singleton instance.
 type ExitManager struct {
-	mu              *sync.RWMutex
-	locks           int
-	notified        bool
-	once            *sync.Once
-	logger          *slog.Logger
-	timeout         time.Duration
-	timeoutMode     TimeoutMode
-	locksCh         chan struct{}
-	notifyCh        chan struct{}
-	shutdown        chan struct{}
-	cleanups        []func()
-	contextCancels  []context.CancelFunc
-	flush           func()
-	httpExitManager httpExitManager
-	exit            exitHandler
+	mu             *sync.RWMutex
+	locks          int
+	notified       bool
+	logger         *slog.Logger
+	timeout        time.Duration
+	timeoutMode    TimeoutMode
+	locksCh        chan struct{}
+	notifyCh       chan struct{}
+	shutdown       chan struct{}
+	cleanups       []func()
+	contextCancels []context.CancelFunc
+	flush          func()
+	exit           exitHandler
 }
 
 var (
@@ -88,7 +84,6 @@ var (
 func newExitManager() *ExitManager {
 	return &ExitManager{
 		mu:       &sync.RWMutex{},
-		once:     &sync.Once{},
 		locksCh:  make(chan struct{}),
 		notifyCh: make(chan struct{}),
 		shutdown: make(chan struct{}),
@@ -152,19 +147,12 @@ func Global() *ExitManager {
 type TimeoutMode int
 
 const (
-	TimeoutModeNone     TimeoutMode = iota // Default mode, which is no timeout
-	TimeoutModeGraceful                    // Timeout is only applied to the cleanup functions
+	TimeoutModeNone     TimeoutMode = iota // Default mode, which is no timeout (waits indefinitely)
+	TimeoutModeGraceful                    // Timeout is only applied to the cleanup functions execution
 	TimeoutModeForceful                    // Timeout is applied to the entire shutdown process
 )
 
 // SetTimeout configures the shutdown timeout behavior based on the specified mode.
-//
-// The mode parameter determines how the timeout is applied:
-//   - TimeoutModeNone: No timeout is applied (waits indefinitely)
-//   - TimeoutModeGraceful: Timeout only applies to cleanup function execution
-//   - TimeoutModeForceful: Timeout applies to the entire shutdown process
-//
-// Consider the time required for cleanup functions to ensure successful shutdown.
 func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
 	em.mu.Lock()
 	em.timeoutMode = mode
@@ -193,8 +181,6 @@ func (em *ExitManager) SetLogger(logger *slog.Logger, flush func()) {
 }
 
 // Locks returns the current number of active shutdown locks.
-// Useful for monitoring shutdown progress. A non-zero value indicates
-// critical operations are still preventing shutdown completion.
 //
 // Example:
 //
@@ -240,11 +226,8 @@ func (em *ExitManager) AcquireShutdownLock() error {
 //
 // Automatically acquires and releases the shutdown lock around
 // the function execution. Returns ErrShutdownInProgress if
-// shutdown has already been initiated.
-//
-// If fn panics, the panic is recovered and the shutdown lock is still
-// properly released. The panic is then re-raised to maintain
-// expected panic behavior while ensuring graceful shutdown continues.
+// shutdown has already been initiated. If fn panics, the method
+// remembers to release the lock.
 func (em *ExitManager) WithShutdownLock(fn func() error) (err error) {
 	if err := em.AcquireShutdownLock(); err != nil {
 		return err
@@ -253,7 +236,7 @@ func (em *ExitManager) WithShutdownLock(fn func() error) (err error) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			// Re-raise the panic after ensuring cleanup
+			em.logger.Error("panic in WithShutdownLock", "panic", r)
 			panic(r)
 		}
 	}()
@@ -283,11 +266,11 @@ func (em *ExitManager) ReleaseShutdownLock() {
 	em.mu.Unlock()
 }
 
-// Notify returns a channel that closes when shutdown is initiated.
-//
-// The channel closes exactly once on the first shutdown signal
-// (SIGINT/SIGTERM or Shutdown()). Remains closed thereafter,
-// so multiple readers can safely select on it.
+// Notify returns a read-only channel that closes when shutdown is initiated
+// by the exit manager. This allows go-routines to register and handle the
+// shutdown process if required. Note, the exit manager may not wait for the
+// go-routine to complete before exiting. If this is a concern, use
+// [RegisterCleanup] for complex cleanup operations.
 //
 // Example:
 //
@@ -303,9 +286,10 @@ func (em *ExitManager) Notify() <-chan struct{} {
 // Shutdown programmatically initiates the shutdown process:
 //
 //  1. Close the notification channel (Notify())
-//  2. Wait for all shutdown locks to be released
-//  3. Execute cleanup functions in reverse registration order
-//  4. Exit the process
+//  2. Cancels all context registered with [NotifyContext]
+//  3. Wait for all shutdown locks to be released
+//  4. Execute cleanup functions in reverse registration order
+//  5. Exit the process
 //
 // Shutdown has the same effect as receiving SIGINT/SIGTERM.
 // The method is non-blocking and is safe to call multiple times.
@@ -461,8 +445,6 @@ func (em *ExitManager) listenForSignals() {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						// This likely won't be received if flush is required.
-						// There's not much we can do about it since we're about to exit.
 						logger.Error("flush logger panicked", "panic", r)
 					}
 				}()
@@ -475,14 +457,11 @@ func (em *ExitManager) listenForSignals() {
 	startedCleanup := make(chan struct{})
 	go func() {
 
-		for _, cancel := range contextCancels {
-			cancel()
-		}
-
-		if httpEM != nil {
-			logger.Info("waiting for http exit manager shutdown")
-			<-httpEM.Done()
-			logger.Info("http exit manager shutdown completed")
+		if len(contextCancels) > 0 {
+			logger.Info("cancelling context cancels", "count", len(contextCancels))
+			for _, cancel := range contextCancels {
+				cancel()
+			}
 		}
 
 		em.mu.RLock()
@@ -496,7 +475,7 @@ func (em *ExitManager) listenForSignals() {
 
 		close(startedCleanup)
 		if len(cleanups) > 0 {
-			logger.Debug("executing cleanup functions", "count", len(cleanups))
+			logger.Info("executing cleanup functions", "count", len(cleanups))
 			for i := len(cleanups) - 1; i >= 0; i-- {
 				func() {
 					defer func() {

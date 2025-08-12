@@ -9,11 +9,10 @@ A Go library that provides **graceful shutdown coordination** for applications, 
 3. **🔒 Lock Coordination**: Waits for all shutdown locks to be released
 4. **🧹 Cleanup Execution**: Runs cleanup functions in reverse registration order  
 5. **🚪 Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
-6. **🌐 HTTP Server Support**: Graceful shutdown coordination for HTTP servers
 
 ## Installation
 
-Compatible with Go 1.14+ versions:
+Compatible with Go 1.21+ versions:
 
 ```bash
 go get github.com/mcwarlus/exit-manager
@@ -56,13 +55,8 @@ Prevent hanging during shutdown by setting a timeout with different modes:
 ```go
 em := exitmanager.Global()
 
-// No timeout (default) - waits indefinitely
 em.SetTimeout(exitmanager.TimeoutModeNone, 30*time.Second)
-
-// Graceful timeout - applies only to cleanup functions
 em.SetTimeout(exitmanager.TimeoutModeGraceful, 30*time.Second)
-
-// Forceful timeout - applies to entire shutdown process
 em.SetTimeout(exitmanager.TimeoutModeForceful, 30*time.Second)
 
 // If timeout expires, the process exits with code 1
@@ -70,7 +64,7 @@ em.SetTimeout(exitmanager.TimeoutModeForceful, 30*time.Second)
 ```
 
 **Timeout Modes:**
-- **`TimeoutModeNone`**: No timeout enforced will wait indefinitely to complete shutdown
+- **`TimeoutModeNone`**: No timeout enforced, will wait indefinitely to complete shutdown
 - **`TimeoutModeGraceful`**: Timeout applies only to cleanup function execution. Good for most applications
 - **`TimeoutModeForceful`**: Timeout applies to the entire shutdown process. Force exit will occur even if locks are still held
 
@@ -81,7 +75,6 @@ Trigger shutdown from your code:
 ```go
 em := exitmanager.Global()
 
-// Trigger shutdown programmatically (same as Ctrl+C)
 go func() {
     time.Sleep(10 * time.Second)
     em.Shutdown()
@@ -90,32 +83,36 @@ go func() {
 <-em.Notify() // Will trigger after 10 seconds
 ```
 
-### Monitoring Active Locks
+### Shutdown locks
 
-Check how many operations are preventing shutdown:
+Exit manager protects operations from shutdown until locks are released:
 
 ```go
 em := exitmanager.Global()
+
+if err := em.AcquireShutdownLock(); err != nil {
+    // shutdown in progress, decide how to handle ...
+}
+defer em.ReleaseShutdownLock()
 
 // Check active locks
 if locks := em.Locks(); locks > 0 {
     log.Printf("Waiting for %d operations to complete...", locks)
 }
+
 ```
 
-# Logging
+### Logging
 
-Both exit managers support structured logging using Go's `log/slog` package. The logging integration provides visibility into shutdown process stages, lock operations, and HTTP server management.
+Exit manager support structured logging via `log/slog`. The logging integration provides visibility into shutdown process stages and lock operations.
 
 ```go
 em := exitmanager.Global()
-em.SetLogger(slog.Default())
+em.SetLogger(slog.Default(), nil)
 
 // The shutdown process will now be communicated via default slog.Logger.
 // You may need to register a flush write cleanup depending on your logger adapter for third party loggers.
-// 
 ```
-
 
 ## Basic Usage
 
