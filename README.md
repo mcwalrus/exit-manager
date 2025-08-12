@@ -2,16 +2,14 @@
 
 A Go library that provides **graceful shutdown coordination** for applications, ensuring critical operations and cleanup completes before process termination. For more information, please see the documentation at: https://pkg.go.dev/github.com/mcwalrus/exit-manager.
 
-A Go library that provides **graceful shutdown coordination** for applications, ensuring critical operations complete before process termination. The libraries presents a simple yet powerful interface, providing cleanup handling, ensuring process exit, and managed HTTP server shutdowns. This library achieves all its functionality with zero external dependencies. For more information, please see the documentation at: https://pkg.go.dev/github.com/mcwalrus/exit-manager.
-
 ## Features
 
 1. **🔄 Signal Handling**: Registers listener for SIGINT (Ctrl+C) and SIGTERM
-2. **📡 Notifications**: When shutdown starts, the `Notify()` channel closes
-3. **🔒 Lock Coordination**: Waits for all shutdown locks to be released
-4. **🧹 Cleanup Execution**: Runs cleanup functions in reverse registration order  
-5. **🚪 Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
-6. **🌐 HTTP Server Support**: Graceful shutdown coordination for HTTP servers
+2. **📡 Notifications**: When shustdown starts, the `Notify()` channel closes
+3. **🌐 Shutdown Servers**: Concurrent shutdowns for HTTP servers
+4. **🔒 Lock Coordination**: Waits for all shutdown locks to be released
+5. **🧹 Cleanup Execution**: Runs cleanup functions in reverse registration order
+6. **🚪 Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
 
 ## Installation
 
@@ -27,17 +25,8 @@ go get github.com/mcwarlus/exit-manager
 Before diving into the API examples, try the interactive CLI to see graceful shutdown in action:
 
 ```bash
-cd cmd/exit-manager
-go run main.go
+cd cmd/exit-manager && go run .
 ```
-
-**Quick Demo Scenario:**
-1. Run the script: `go run main.go`
-2. Try different timeout modes: `st 5s graceful` or `st 3s forceful`
-3. Type `l` (enter) a few times to acquire locks
-4. Type `s` (enter) to trigger shutdown - notice it waits for locks!
-5. Type `u` (enter) to release locks and watch cleanup execute
-6. Or try Ctrl+C to see real signal handling
 
 The CLI will provide a hands-on experience that will help you understand the timeout modes and concepts before reading the code examples below.
 
@@ -47,74 +36,6 @@ Test with race condition detection:
 
 ```bash
 go test -race ./...
-```
-
-## API
-
-### Timeout Protection
-
-Prevent hanging during shutdown by setting a timeout with different modes:
-
-```go
-em := exitmanager.Global()
-
-em.SetTimeout(exitmanager.TimeoutModeNone, 30*time.Second)
-em.SetTimeout(exitmanager.TimeoutModeGraceful, 30*time.Second)
-em.SetTimeout(exitmanager.TimeoutModeForceful, 30*time.Second)
-
-// If timeout expires, the process exits with code 1
-// If shutdown completes normally, the process exits with code 0
-```
-
-**Timeout Modes:**
-- **`TimeoutModeNone`**: No timeout enforced, will wait indefinitely to complete shutdown
-- **`TimeoutModeGraceful`**: Timeout applies only to cleanup function execution. Good for most applications
-- **`TimeoutModeForceful`**: Timeout applies to the entire shutdown process. Force exit will occur even if locks are still held
-
-### Programmatic Shutdown
-
-Trigger shutdown from your code:
-
-```go
-em := exitmanager.Global()
-
-go func() {
-    time.Sleep(10 * time.Second)
-    em.Shutdown()
-}()
-
-<-em.Notify() // Will trigger after 10 seconds
-```
-
-### Shutdown locks
-
-Exit manager protects operations from shutdown until locks are released:
-
-```go
-em := exitmanager.Global()
-
-if err := em.AcquireShutdownLock(); err != nil {
-    // shutdown in progress, decide how to handle ...
-}
-defer em.ReleaseShutdownLock()
-
-// Check active locks
-if locks := em.Locks(); locks > 0 {
-    log.Printf("Waiting for %d operations to complete...", locks)
-}
-
-```
-
-### Logging
-
-Exit manager support structured logging via `log/slog`. The logging integration provides visibility into shutdown process stages and lock operations.
-
-```go
-em := exitmanager.Global()
-em.SetLogger(slog.Default(), nil)
-
-// The shutdown process will now be communicated via default slog.Logger.
-// You may need to register a flush write cleanup depending on your logger adapter for third party loggers.
 ```
 
 ## Basic Usage
@@ -143,7 +64,7 @@ func main() {
     <-em.Notify()
     log.Println("Shutdown signal received, exiting gracefully...")
 
-    // Avoids exit on main routine
+    // Avoid exit on main routine
     select {}
 }
 
@@ -189,21 +110,13 @@ func main() {
     <-em.Notify()
     log.Println("Shutdown initiated, waiting for critical operations...")
     
-    // Avoids exit on main routine
+    // Avoid exit on main routine
     select {}
 }
 
 func criticalWorker(em *exitmanager.ExitManager, id int) {
     for {
-        // Check if shutdown has started
-        select {
-        case <-em.Notify():
-            log.Printf("Worker %d: received shutdown signal, exiting", id)
-            return
-        default:
-        }
-
-        // Protect critical operation with a shutdown lock
+        // Acquire lock to prevent shutdown
         if err := em.AcquireShutdownLock(); err != nil {
             log.Printf("Worker %d: shutdown in progress, cannot start new work", id)
             return
@@ -215,8 +128,13 @@ func criticalWorker(em *exitmanager.ExitManager, id int) {
         log.Printf("Worker %d: critical operation complete", id)
         em.ReleaseShutdownLock()
 
-        // Small delay before next operation
-        time.Sleep(1 * time.Second)
+        // Check if shutdown has started
+        select {
+        case <-em.Notify():
+            log.Printf("Worker %d: received shutdown signal, exiting", id)
+            return
+        case <-time.After(1 * time.Second):
+        }
     }
 }
 ```
@@ -328,6 +246,92 @@ func longRunningTask(ctx context.Context) {
             log.Println("Long-running task: processing...")
         }
     }
+}
+```
+
+### HTTP Server Graceful Shutdown
+
+Use when you have HTTP servers that need to be shutdown gracefully. The exit manager can coordinate multiple servers and pre-shutdown handlers for complex scenarios like closing hijacked connections or notifying load balancers.
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "net/http"
+    "time"
+
+    exitmanager "github.com/mcwalrus/exit-manager"
+)
+
+func main() {
+    em := exitmanager.Global()
+    
+    // Configure HTTP server shutdown timeout
+    em.SetServerTimeout(30 * time.Second)
+    
+    // Create HTTP servers
+    mainServer := &http.Server{
+        Addr:    ":8080",
+        Handler: http.DefaultServeMux,
+    }
+    
+    adminServer := &http.Server{
+        Addr:    ":8081", 
+        Handler: http.DefaultServeMux,
+    }
+    
+    // Register pre-shutdown handler for custom cleanup
+    em.RegisterPreShutdown(func() {
+        log.Println("Notifying load balancer of shutdown...")
+        // Custom logic to notify load balancer
+        time.Sleep(2 * time.Second)
+    })
+    
+    // Register servers for graceful shutdown
+    if err := em.RegisterServer(mainServer); err != nil {
+        log.Fatal("Failed to register main server:", err)
+    }
+    
+    if err := em.RegisterServer(adminServer); err != nil {
+        log.Fatal("Failed to register admin server:", err)
+    }
+    
+    // Setup routes
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte("Hello World!"))
+    })
+    
+    http.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte("Admin Panel"))
+    })
+    
+    // Start servers
+    go func() {
+        log.Println("Starting main server on :8080")
+        if err := mainServer.ListenAndServe(); err != http.ErrServerClosed {
+            log.Fatal("Main server error:", err)
+        }
+    }()
+    
+    go func() {
+        log.Println("Starting admin server on :8081")
+        if err := adminServer.ListenAndServe(); err != http.ErrServerClosed {
+            log.Fatal("Admin server error:", err)
+        }
+    }()
+    
+    log.Println("Servers started. Press Ctrl+C to shutdown gracefully...")
+    
+    // Wait for shutdown signal
+    <-em.Notify()
+    log.Println("Shutdown initiated, gracefully stopping servers...")
+    
+    // Exit manager handles server shutdown automatically
+    select {}
 }
 ```
 
