@@ -454,6 +454,22 @@ func (em *ExitManager) NotifyContext(ctx context.Context) (context.Context, cont
 	return ctx, cancel
 }
 
+// flushLogger flushes the logger if a flush function is provided.
+// This is useful for third party loggers that need to be flushed
+// to ensure all logs are written to the underlying writer.
+func flushLogger(logger *slog.Logger, flush func()) {
+	if flush != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("flush logger panicked", "panic", r)
+				}
+			}()
+			flush()
+		}()
+	}
+}
+
 // listenForSignals handles signal registration and coordinates the shutdown process.
 func (em *ExitManager) listenForSignals() {
 	sigCh := make(chan os.Signal, 1)
@@ -486,22 +502,6 @@ func (em *ExitManager) listenForSignals() {
 		"pre_shutdown_hooks", len(preShutdowns),
 		"http_servers", len(servers),
 	)
-
-	// flushLogger flushes the logger if a flush function is provided.
-	// This is useful for third party loggers that need to be flushed
-	// to ensure all logs are written to the underlying writer.
-	flushLogger := func(logger *slog.Logger, flush func()) {
-		if flush != nil {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						logger.Error("flush logger panicked", "panic", r)
-					}
-				}()
-				flush()
-			}()
-		}
-	}
 
 	done := make(chan struct{})
 	startedCleanup := make(chan struct{})
@@ -604,7 +604,12 @@ func (em *ExitManager) listenForSignals() {
 	}()
 
 	// no timeout set
-	if em.timeoutMode == TimeoutModeNone || em.timeout <= 0 {
+	em.mu.RLock()
+	timeoutMode := em.timeoutMode
+	timeout := em.timeout
+	em.mu.RUnlock()
+
+	if timeoutMode == TimeoutModeNone || timeout <= 0 {
 		<-done
 		logger.Info("graceful shutdown completed")
 		flushLogger(logger, flush)
@@ -620,8 +625,8 @@ func (em *ExitManager) listenForSignals() {
 			logger.Info("graceful shutdown completed")
 			flushLogger(logger, flush)
 			em.exit.Exit(0)
-		case <-time.After(em.timeout):
-			logger.Error("graceful shutdown timeout expired", "timeout", em.timeout)
+		case <-time.After(timeout):
+			logger.Error("graceful shutdown timeout expired", "timeout", timeout)
 			flushLogger(logger, flush)
 			em.exit.Exit(1)
 		}
@@ -634,8 +639,8 @@ func (em *ExitManager) listenForSignals() {
 		logger.Info("graceful shutdown completed")
 		flushLogger(logger, flush)
 		em.exit.Exit(0)
-	case <-time.After(em.timeout):
-		logger.Error("forceful shutdown timeout expired", "timeout", em.timeout)
+	case <-time.After(timeout):
+		logger.Error("forceful shutdown timeout expired", "timeout", timeout)
 		flushLogger(logger, flush)
 		em.exit.Exit(1)
 	}
