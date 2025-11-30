@@ -170,18 +170,23 @@ func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
 	em.mu.Unlock()
 }
 
-// The different modes of response to multiple signals.
-// Ignore will disregard all subsequent signals.
-// Standard will wait for all shutdown locks to be released.
-// Forceful will exit immediately.
+// MultipleSignalsMode determines how the exit manager responds to
+// additional shutdown signals (SIGINT/SIGTERM) received after the
+// initial shutdown has been initiated.
 type MultipleSignalsMode int
 
 const (
-	MultipleSignalsModeStandard MultipleSignalsMode = iota
-	MultipleSignalsModeForcefulExit
-	MultipleSignalsModeIgnore
+	MultipleSignalsModeEnsureLocksRelease MultipleSignalsMode = iota // Additional signals will exit once all shutdown locks are released (can exit before cleanups completes)
+	MultipleSignalsModeForcefulExit                                  // Additional signals cause immediate exit (bypasses locks and registered cleanups)
+	MultipleSignalsModeIgnore                                        // Additional signals are ignored, graceful shutdown continues
 )
 
+// SetMultipleSignalsMode configures how the exit manager responds to
+// additional shutdown signals received after shutdown has been initiated.
+//
+// Example:
+//
+//	em.SetMultipleSignalsMode(exitmanager.MultipleSignalsModeForcefulExit)
 func (em *ExitManager) SetMultipleSignalsMode(mode MultipleSignalsMode) {
 	em.mu.Lock()
 	em.mSignalsMode = mode
@@ -422,6 +427,7 @@ func (em *ExitManager) listenForSignals() {
 
 	em.mu.Lock()
 	em.notified = true
+	mode := em.mSignalsMode
 	cleanups := append([]func(){}, em.cleanups...)
 	contextCancels := append([]context.CancelFunc{}, em.contextCancels...)
 	logger := em.logger
@@ -436,36 +442,26 @@ func (em *ExitManager) listenForSignals() {
 	)
 
 	// Continue listening for additional signals
+	done := make(chan struct{})
+	startedCleanup := make(chan struct{})
 	go func() {
-		for {
-			select {
-			case <-sigCh:
-				em.mu.RLock()
-				mode := em.mSignalsMode
-				em.mu.RUnlock()
-
-				switch mode {
-				case MultipleSignalsModeIgnore:
-					logger.Info("additional signal received, ignoring", "mode", "ignore")
-				case MultipleSignalsModeStandard:
-					logger.Info("additional signal received, continuing graceful shutdown", "mode", "standard")
-				case MultipleSignalsModeForcefulExit:
-					logger.Info("additional signal received, forcing immediate exit", "mode", "forceful")
-					select {
-					case <-em.forcefulExit:
-					default:
-						close(em.forcefulExit)
-					}
-					return
-				}
-			case <-em.forcefulExit:
+		for range sigCh {
+			switch mode {
+			case MultipleSignalsModeIgnore:
+				logger.Info("additional signal received, ignoring", "mode", "ignore")
+			case MultipleSignalsModeEnsureLocksRelease:
+				logger.Info("additional signal received, exit once shutdown locks are released", "mode", "ensure locks release")
+				<-startedCleanup
+				close(em.forcefulExit)
+				return
+			case MultipleSignalsModeForcefulExit:
+				logger.Info("additional signal received, forcing immediate exit", "mode", "forceful")
+				close(em.forcefulExit)
 				return
 			}
 		}
 	}()
 
-	done := make(chan struct{})
-	startedCleanup := make(chan struct{})
 	go func() {
 		defer func() {
 			logger.Info("shutdown completed")
