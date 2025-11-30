@@ -5,7 +5,7 @@ A Go library that provides **graceful shutdown coordination** for applications, 
 ## Features
 
 1. **🔄 Signal Handling**: Registers listener for SIGINT (Ctrl+C) and SIGTERM
-2. **📡 Notifications**: When shustdown starts, the `Notify()` channel closes
+2. **📡 Notifications**: When shustdown starts, the `em.Notify()` channel closes
 4. **🔒 Lock Coordination**: Waits for all shutdown locks to be released
 5. **🧹 Cleanup Execution**: Runs cleanup functions in reverse registration order
 6. **🚪 Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
