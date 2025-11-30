@@ -66,9 +66,11 @@ type ExitManager struct {
 	logger         *slog.Logger
 	timeout        time.Duration
 	timeoutMode    TimeoutMode
+	mSignalsMode   MultipleSignalsMode
 	locksCh        chan struct{}
 	notifyCh       chan struct{}
 	shutdown       chan struct{}
+	forcefulExit   chan struct{}
 	cleanups       []func()
 	contextCancels []context.CancelFunc
 	flush          func()
@@ -83,12 +85,13 @@ var (
 // newExitManager returns a new exit manager instance.
 func newExitManager() *ExitManager {
 	return &ExitManager{
-		mu:       &sync.RWMutex{},
-		locksCh:  make(chan struct{}),
-		notifyCh: make(chan struct{}),
-		shutdown: make(chan struct{}),
-		exit:     osExitHandler{},
-		logger:   noopLogger(),
+		mu:           &sync.RWMutex{},
+		locksCh:      make(chan struct{}),
+		notifyCh:     make(chan struct{}),
+		shutdown:     make(chan struct{}),
+		forcefulExit: make(chan struct{}),
+		exit:         osExitHandler{},
+		logger:       noopLogger(),
 	}
 }
 
@@ -164,6 +167,24 @@ func (em *ExitManager) SetTimeout(mode TimeoutMode, timeout time.Duration) {
 	em.mu.Lock()
 	em.timeoutMode = mode
 	em.timeout = timeout
+	em.mu.Unlock()
+}
+
+// The different modes of response to multiple signals.
+// Ignore will disregard all subsequent signals.
+// Standard will wait for all shutdown locks to be released.
+// Forceful will exit immediately.
+type MultipleSignalsMode int
+
+const (
+	MultipleSignalsModeStandard MultipleSignalsMode = iota
+	MultipleSignalsModeForcefulExit
+	MultipleSignalsModeIgnore
+)
+
+func (em *ExitManager) SetMultipleSignalsMode(mode MultipleSignalsMode) {
+	em.mu.Lock()
+	em.mSignalsMode = mode
 	em.mu.Unlock()
 }
 
@@ -414,6 +435,35 @@ func (em *ExitManager) listenForSignals() {
 		"context_cancels", len(contextCancels),
 	)
 
+	// Continue listening for additional signals
+	go func() {
+		for {
+			select {
+			case <-sigCh:
+				em.mu.RLock()
+				mode := em.mSignalsMode
+				em.mu.RUnlock()
+
+				switch mode {
+				case MultipleSignalsModeIgnore:
+					logger.Info("additional signal received, ignoring", "mode", "ignore")
+				case MultipleSignalsModeStandard:
+					logger.Info("additional signal received, continuing graceful shutdown", "mode", "standard")
+				case MultipleSignalsModeForcefulExit:
+					logger.Info("additional signal received, forcing immediate exit", "mode", "forceful")
+					select {
+					case <-em.forcefulExit:
+					default:
+						close(em.forcefulExit)
+					}
+					return
+				}
+			case <-em.forcefulExit:
+				return
+			}
+		}
+	}()
+
 	done := make(chan struct{})
 	startedCleanup := make(chan struct{})
 	go func() {
@@ -430,7 +480,7 @@ func (em *ExitManager) listenForSignals() {
 			}
 		}
 
-		// Wait for shutdown locks to be released
+		// Wait for shutdown locks to be released or forceful exit
 		em.mu.RLock()
 		locks := em.locks
 		em.mu.RUnlock()
@@ -466,10 +516,16 @@ func (em *ExitManager) listenForSignals() {
 	em.mu.RUnlock()
 
 	if timeoutMode == TimeoutModeNone || timeout <= 0 {
-		<-done
-		logger.Info("graceful shutdown completed")
-		flushLogger(logger, flush)
-		em.exit.Exit(0)
+		select {
+		case <-done:
+			logger.Info("graceful shutdown completed")
+			flushLogger(logger, flush)
+			em.exit.Exit(0)
+		case <-em.forcefulExit:
+			logger.Info("forceful exit completed")
+			flushLogger(logger, flush)
+			em.exit.Exit(1)
+		}
 		return
 	}
 
@@ -485,6 +541,10 @@ func (em *ExitManager) listenForSignals() {
 			logger.Error("graceful shutdown timeout expired", "timeout", timeout)
 			flushLogger(logger, flush)
 			em.exit.Exit(1)
+		case <-em.forcefulExit:
+			logger.Info("forceful exit completed")
+			flushLogger(logger, flush)
+			em.exit.Exit(1)
 		}
 		return
 	}
@@ -497,6 +557,10 @@ func (em *ExitManager) listenForSignals() {
 		em.exit.Exit(0)
 	case <-time.After(timeout):
 		logger.Error("forceful shutdown timeout expired", "timeout", timeout)
+		flushLogger(logger, flush)
+		em.exit.Exit(1)
+	case <-em.forcefulExit:
+		logger.Info("forceful exit completed")
 		flushLogger(logger, flush)
 		em.exit.Exit(1)
 	}
