@@ -6,7 +6,6 @@ A Go library that provides **graceful shutdown coordination** for applications, 
 
 1. **🔄 Signal Handling**: Registers listener for SIGINT (Ctrl+C) and SIGTERM
 2. **📡 Notifications**: When shustdown starts, the `Notify()` channel closes
-3. **🌐 Shutdown Servers**: Concurrent shutdowns for HTTP servers
 4. **🔒 Lock Coordination**: Waits for all shutdown locks to be released
 5. **🧹 Cleanup Execution**: Runs cleanup functions in reverse registration order
 6. **🚪 Process Exit**: Terminates with exit code 0 (success) or 1 (timeout)
@@ -212,9 +211,10 @@ import (
 )
 
 func main() {
+    // Resigster exit-manager
     em := exitmanager.Global()
 
-    // Register a context that is cancelled on shutdown
+    // Register context
     ctx, cancel := em.NotifyContext(context.Background())
     defer cancel()
 
@@ -246,92 +246,6 @@ func longRunningTask(ctx context.Context) {
             log.Println("Long-running task: processing...")
         }
     }
-}
-```
-
-### HTTP Server Graceful Shutdown
-
-Use when you have HTTP servers that need to be shutdown gracefully. The exit manager can coordinate multiple servers and pre-shutdown handlers for complex scenarios like closing hijacked connections or notifying load balancers.
-
-```go
-package main
-
-import (
-    "context"
-    "log"
-    "net/http"
-    "time"
-
-    exitmanager "github.com/mcwalrus/exit-manager"
-)
-
-func main() {
-    em := exitmanager.Global()
-    
-    // Configure HTTP server shutdown timeout
-    em.SetServerTimeout(30 * time.Second)
-    
-    // Create HTTP servers
-    mainServer := &http.Server{
-        Addr:    ":8080",
-        Handler: http.DefaultServeMux,
-    }
-    
-    adminServer := &http.Server{
-        Addr:    ":8081", 
-        Handler: http.DefaultServeMux,
-    }
-    
-    // Register pre-shutdown handler for custom cleanup
-    em.RegisterPreShutdown(func() {
-        log.Println("Notifying load balancer of shutdown...")
-        // Custom logic to notify load balancer
-        time.Sleep(2 * time.Second)
-    })
-    
-    // Register servers for graceful shutdown
-    if err := em.RegisterServer(mainServer); err != nil {
-        log.Fatal("Failed to register main server:", err)
-    }
-    
-    if err := em.RegisterServer(adminServer); err != nil {
-        log.Fatal("Failed to register admin server:", err)
-    }
-    
-    // Setup routes
-    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-        w.WriteHeader(http.StatusOK)
-        w.Write([]byte("Hello World!"))
-    })
-    
-    http.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
-        w.WriteHeader(http.StatusOK)
-        w.Write([]byte("Admin Panel"))
-    })
-    
-    // Start servers
-    go func() {
-        log.Println("Starting main server on :8080")
-        if err := mainServer.ListenAndServe(); err != http.ErrServerClosed {
-            log.Fatal("Main server error:", err)
-        }
-    }()
-    
-    go func() {
-        log.Println("Starting admin server on :8081")
-        if err := adminServer.ListenAndServe(); err != http.ErrServerClosed {
-            log.Fatal("Admin server error:", err)
-        }
-    }()
-    
-    log.Println("Servers started. Press Ctrl+C to shutdown gracefully...")
-    
-    // Wait for shutdown signal
-    <-em.Notify()
-    log.Println("Shutdown initiated, gracefully stopping servers...")
-    
-    // Exit manager handles server shutdown automatically
-    select {}
 }
 ```
 
