@@ -832,3 +832,271 @@ func TestPanicHandling(t *testing.T) {
 		checkExitCode(t, em, 0)
 	})
 }
+
+// triggerForcefulExit simulates receiving an additional signal in forceful exit mode
+// by closing the forcefulExit channel. This is a test helper to verify forceful exit behavior.
+func triggerForcefulExit(em *ExitManager) {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	select {
+	case <-em.forcefulExit:
+	default:
+		close(em.forcefulExit)
+	}
+}
+
+func TestMultipleSignalsMode(t *testing.T) {
+	t.Parallel()
+
+	t.Run("set multiple signals mode standard", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetMultipleSignalsMode(MultipleSignalsModeEnsureLocksRelease)
+
+		// Standard mode should allow normal graceful shutdown
+		em.Shutdown()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited after shutdown started")
+		}
+
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("set multiple signals mode ignore", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetMultipleSignalsMode(MultipleSignalsModeIgnore)
+
+		// Ignore mode should allow normal graceful shutdown
+		em.Shutdown()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited after shutdown started")
+		}
+
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("set multiple signals mode forceful exit", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetMultipleSignalsMode(MultipleSignalsModeForcefulExit)
+
+		// Forceful exit mode should allow normal graceful shutdown initially
+		em.Shutdown()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited after shutdown started")
+		}
+
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("standard mode continues graceful shutdown with locks", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetMultipleSignalsMode(MultipleSignalsModeEnsureLocksRelease)
+
+		// Acquire a lock
+		_ = em.AcquireShutdownLock()
+		em.Shutdown()
+
+		// Should wait for lock release (standard behavior)
+		select {
+		case <-em.exit.Done():
+			t.Fatal("expected exit manager to wait for lock release")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		// Release lock - should complete gracefully
+		em.ReleaseShutdownLock()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited after lock release")
+		}
+
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("ignore mode continues graceful shutdown with locks", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetMultipleSignalsMode(MultipleSignalsModeIgnore)
+
+		// Acquire a lock
+		_ = em.AcquireShutdownLock()
+		em.Shutdown()
+
+		// Should wait for lock release (ignore mode doesn't change this)
+		select {
+		case <-em.exit.Done():
+			t.Fatal("expected exit manager to wait for lock release")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		// Release lock - should complete gracefully
+		em.ReleaseShutdownLock()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited after lock release")
+		}
+
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("forceful exit mode exits immediately when triggered", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetMultipleSignalsMode(MultipleSignalsModeForcefulExit)
+
+		// Acquire a lock to prevent normal shutdown
+		_ = em.AcquireShutdownLock()
+		em.Shutdown()
+
+		// Should wait for lock release initially
+		select {
+		case <-em.exit.Done():
+			t.Fatal("expected exit manager to wait for lock release")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		// Simulate receiving an additional signal (forceful exit)
+		triggerForcefulExit(em)
+
+		// Should exit immediately with code 1, bypassing lock release
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited immediately after forceful exit")
+		}
+
+		checkExitCode(t, em, 1)
+	})
+
+	t.Run("forceful exit mode exits immediately even during cleanup", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetMultipleSignalsMode(MultipleSignalsModeForcefulExit)
+
+		// Register a slow cleanup function
+		em.RegisterCleanup(func() {
+			time.Sleep(200 * time.Millisecond)
+		})
+
+		em.Shutdown()
+
+		// Wait a bit to ensure cleanup starts
+		time.Sleep(50 * time.Millisecond)
+
+		// Simulate receiving an additional signal (forceful exit)
+		triggerForcefulExit(em)
+
+		// Should exit immediately, potentially before cleanup completes
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited immediately after forceful exit")
+		}
+
+		checkExitCode(t, em, 1)
+		// Cleanup may or may not have executed depending on timing
+	})
+
+	t.Run("standard mode allows normal completion even after mode change", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetMultipleSignalsMode(MultipleSignalsModeForcefulExit)
+		em.SetMultipleSignalsMode(MultipleSignalsModeEnsureLocksRelease) // Change to standard
+
+		_ = em.AcquireShutdownLock()
+		em.Shutdown()
+
+		// Should wait for lock release (standard mode)
+		select {
+		case <-em.exit.Done():
+			t.Fatal("expected exit manager to wait for lock release in standard mode")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		// Release lock - should complete gracefully
+		em.ReleaseShutdownLock()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited after lock release")
+		}
+
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("mode can be changed during shutdown", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetMultipleSignalsMode(MultipleSignalsModeEnsureLocksRelease)
+
+		_ = em.AcquireShutdownLock()
+		em.Shutdown()
+
+		// Change mode during shutdown
+		em.SetMultipleSignalsMode(MultipleSignalsModeForcefulExit)
+
+		// Trigger forceful exit
+		triggerForcefulExit(em)
+
+		// Should exit immediately
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited immediately after forceful exit")
+		}
+
+		checkExitCode(t, em, 1)
+	})
+
+	t.Run("ignore mode continues graceful shutdown normally", func(t *testing.T) {
+		em := testExitManager(t)
+		em.SetMultipleSignalsMode(MultipleSignalsModeIgnore)
+
+		_ = em.AcquireShutdownLock()
+		em.Shutdown()
+
+		// Should wait for lock release (ignore mode)
+		select {
+		case <-em.exit.Done():
+			t.Fatal("expected exit manager to wait for lock release in ignore mode")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		// Release lock - should complete gracefully
+		em.ReleaseShutdownLock()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited after lock release")
+		}
+
+		checkExitCode(t, em, 0)
+	})
+
+	t.Run("default mode is standard", func(t *testing.T) {
+		em := testExitManager(t)
+
+		// Don't set any mode - should default to standard
+		_ = em.AcquireShutdownLock()
+		em.Shutdown()
+
+		// Should wait for lock release (standard mode is default)
+		select {
+		case <-em.exit.Done():
+			t.Fatal("expected exit manager to wait for lock release in standard mode")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		// Release lock - should complete gracefully
+		em.ReleaseShutdownLock()
+		select {
+		case <-em.exit.Done():
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected exit manager to have exited after lock release")
+		}
+
+		checkExitCode(t, em, 0)
+	})
+}
