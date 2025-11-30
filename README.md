@@ -1,5 +1,11 @@
 # Exit Manager
 
+[![Go Version](https://img.shields.io/github/go-mod/go-version/mcwalrus/exit-manager)](https://golang.org/)
+[![Go Report Card](https://goreportcard.com/badge/github.com/mcwalrus/exit-manager)](https://goreportcard.com/report/github.com/mcwalrus/exit-manager)
+[![codecov](https://codecov.io/gh/mcwalrus/exit-manager/branch/main/graph/badge.svg)](https://codecov.io/gh/mcwalrus/exit-manager) 
+[![GoDoc](https://godoc.org/github.com/mcwalrus/exit-manager?status.svg)](https://godoc.org/github.com/mcwalrus/exit-manager)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Exit Manager is a module for **graceful shutdown coordination** to ensure critical operations complete and cleanup runs before your application exits. See [full documentation](https://pkg.go.dev/github.com/mcwalrus/exit-manager).
 
 ## Features
