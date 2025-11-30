@@ -78,8 +78,10 @@ type ExitManager struct {
 }
 
 var (
-	once    sync.Once
-	manager *ExitManager
+	once              sync.Once
+	manager           *ExitManager
+	signalsMu         sync.RWMutex
+	configuredSignals []os.Signal
 )
 
 // newExitManager returns a new exit manager instance.
@@ -117,9 +119,24 @@ func (ehi osExitHandler) Done() <-chan struct{} {
 	return nil
 }
 
+// SetSignals configures which signals the exit manager should listen for.
+// This must be called before the first call to [Global]. If not called,
+// the default signals SIGINT and SIGTERM will be used.
+//
+// Example:
+//
+//	exitmanager.SetSignals(syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+//	em := exitmanager.Global()
+func SetSignals(signals ...os.Signal) {
+	signalsMu.Lock()
+	defer signalsMu.Unlock()
+	configuredSignals = signals
+}
+
 // Global returns the singleton ExitManager instance.
 //
-// The first call registers signal handlers for SIGINT and SIGTERM.
+// The first call registers signal handlers for the signals configured via
+// [SetSignals], or SIGINT and SIGTERM by default if [SetSignals] was not called.
 // Subsequent calls return the same instance. Safe for concurrent access.
 //
 // Example:
@@ -415,7 +432,20 @@ func flushLogger(logger *slog.Logger, flush func()) {
 // listenForSignals handles signal registration and coordinates the shutdown process.
 func (em *ExitManager) listenForSignals() {
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	signalsMu.RLock()
+	var signals []os.Signal
+	if len(configuredSignals) > 0 {
+		signals = make([]os.Signal, len(configuredSignals))
+		copy(signals, configuredSignals)
+	}
+	signalsMu.RUnlock()
+
+	if len(signals) == 0 {
+		signals = []os.Signal{syscall.SIGINT, syscall.SIGTERM}
+	}
+
+	signal.Notify(sigCh, signals...)
 
 	var shutdownSource string
 	select {
