@@ -850,7 +850,7 @@ func TestMultipleSignalsMode(t *testing.T) {
 
 	t.Run("set multiple signals mode standard", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetMultipleSignalsMode(MultipleSignalsModeEnsureLocksRelease)
+		em.SetMultipleSignals(MultipleSignalsModeEnsureLocksRelease)
 
 		// Standard mode should allow normal graceful shutdown
 		em.Shutdown()
@@ -865,7 +865,7 @@ func TestMultipleSignalsMode(t *testing.T) {
 
 	t.Run("set multiple signals mode ignore", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetMultipleSignalsMode(MultipleSignalsModeIgnore)
+		em.SetMultipleSignals(MultipleSignalsModeIgnore)
 
 		// Ignore mode should allow normal graceful shutdown
 		em.Shutdown()
@@ -880,7 +880,7 @@ func TestMultipleSignalsMode(t *testing.T) {
 
 	t.Run("set multiple signals mode forceful exit", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetMultipleSignalsMode(MultipleSignalsModeForcefulExit)
+		em.SetMultipleSignals(MultipleSignalsModeForcefulExit)
 
 		// Forceful exit mode should allow normal graceful shutdown initially
 		em.Shutdown()
@@ -895,7 +895,7 @@ func TestMultipleSignalsMode(t *testing.T) {
 
 	t.Run("standard mode continues graceful shutdown with locks", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetMultipleSignalsMode(MultipleSignalsModeEnsureLocksRelease)
+		em.SetMultipleSignals(MultipleSignalsModeEnsureLocksRelease)
 
 		// Acquire a lock
 		_ = em.AcquireShutdownLock()
@@ -921,7 +921,7 @@ func TestMultipleSignalsMode(t *testing.T) {
 
 	t.Run("ignore mode continues graceful shutdown with locks", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetMultipleSignalsMode(MultipleSignalsModeIgnore)
+		em.SetMultipleSignals(MultipleSignalsModeIgnore)
 
 		// Acquire a lock
 		_ = em.AcquireShutdownLock()
@@ -947,7 +947,7 @@ func TestMultipleSignalsMode(t *testing.T) {
 
 	t.Run("forceful exit mode exits immediately when triggered", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetMultipleSignalsMode(MultipleSignalsModeForcefulExit)
+		em.SetMultipleSignals(MultipleSignalsModeForcefulExit)
 
 		// Acquire a lock to prevent normal shutdown
 		_ = em.AcquireShutdownLock()
@@ -975,7 +975,7 @@ func TestMultipleSignalsMode(t *testing.T) {
 
 	t.Run("forceful exit mode exits immediately even during cleanup", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetMultipleSignalsMode(MultipleSignalsModeForcefulExit)
+		em.SetMultipleSignals(MultipleSignalsModeForcefulExit)
 
 		// Register a slow cleanup function
 		em.RegisterCleanup(func() {
@@ -1003,8 +1003,8 @@ func TestMultipleSignalsMode(t *testing.T) {
 
 	t.Run("standard mode allows normal completion even after mode change", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetMultipleSignalsMode(MultipleSignalsModeForcefulExit)
-		em.SetMultipleSignalsMode(MultipleSignalsModeEnsureLocksRelease) // Change to standard
+		em.SetMultipleSignals(MultipleSignalsModeForcefulExit)
+		em.SetMultipleSignals(MultipleSignalsModeEnsureLocksRelease) // Change to standard
 
 		_ = em.AcquireShutdownLock()
 		em.Shutdown()
@@ -1029,13 +1029,13 @@ func TestMultipleSignalsMode(t *testing.T) {
 
 	t.Run("mode can be changed during shutdown", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetMultipleSignalsMode(MultipleSignalsModeEnsureLocksRelease)
+		em.SetMultipleSignals(MultipleSignalsModeEnsureLocksRelease)
 
 		_ = em.AcquireShutdownLock()
 		em.Shutdown()
 
 		// Change mode during shutdown
-		em.SetMultipleSignalsMode(MultipleSignalsModeForcefulExit)
+		em.SetMultipleSignals(MultipleSignalsModeForcefulExit)
 
 		// Trigger forceful exit
 		triggerForcefulExit(em)
@@ -1052,7 +1052,7 @@ func TestMultipleSignalsMode(t *testing.T) {
 
 	t.Run("ignore mode continues graceful shutdown normally", func(t *testing.T) {
 		em := testExitManager(t)
-		em.SetMultipleSignalsMode(MultipleSignalsModeIgnore)
+		em.SetMultipleSignals(MultipleSignalsModeIgnore)
 
 		_ = em.AcquireShutdownLock()
 		em.Shutdown()

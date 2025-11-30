@@ -198,13 +198,13 @@ const (
 	MultipleSignalsModeIgnore                                        // Additional signals are ignored, graceful shutdown continues
 )
 
-// SetMultipleSignalsMode configures how the exit manager responds to
+// SetMultipleSignals configures how the exit manager responds to
 // additional shutdown signals received after shutdown has been initiated.
 //
 // Example:
 //
-//	em.SetMultipleSignalsMode(exitmanager.MultipleSignalsModeForcefulExit)
-func (em *ExitManager) SetMultipleSignalsMode(mode MultipleSignalsMode) {
+//	em.SetMultipleSignals(exitmanager.MultipleSignalsModeForcefulExit)
+func (em *ExitManager) SetMultipleSignals(mode MultipleSignalsMode) {
 	em.mu.Lock()
 	em.mSignalsMode = mode
 	em.mu.Unlock()

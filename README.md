@@ -206,7 +206,7 @@ import (
 
 func main() {
     em := exitmanager.Global()
-    em.SetMultipleSignalsMode(exitmanager.MultipleSignalsModeForcefulExit)
+    em.SetMultipleSignals(exitmanager.MultipleSignalsModeForcefulExit)
 
     em.RegisterCleanup(func() {
         log.Println("Cleaning up...")
